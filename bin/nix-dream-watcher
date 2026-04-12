@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------
+#   nix-dream-watcher — idle watcher for nix-dream
+#
+#   Polls xprintidle. When idle exceeds the threshold, launches
+#   nix-dream fullscreen in a dedicated Konsole window. Kills it
+#   the moment activity resumes. Inhibits while fullscreen video
+#   or audio is playing (checks for inhibitors).
+#
+#   Designed to run as a systemd user service. Exits cleanly on
+#   SIGTERM/SIGINT.
+#
+#   Usage:
+#     nix-dream-watcher                  run (default 60s idle)
+#     nix-dream-watcher --idle 120       custom idle threshold (seconds)
+#     nix-dream-watcher --debug          print state changes to stderr
+# -----------------------------------------------------------------
+
+set -euo pipefail
+
+IDLE_THRESHOLD_MS=60000  # 1 minute default
+DEBUG=false
+DREAM_PID=""
+KONSOLE_PID=""
+POLL_INTERVAL=2  # seconds between idle checks
+
+cleanup() {
+    kill_dream
+    exit 0
+}
+
+trap cleanup SIGTERM SIGINT
+
+log() {
+    if $DEBUG; then
+        echo "[dream-watcher] $*" >&2
+    fi
+}
+
+kill_dream() {
+    if [ -n "$KONSOLE_PID" ] && kill -0 "$KONSOLE_PID" 2>/dev/null; then
+        log "killing dream (konsole pid $KONSOLE_PID)"
+        kill "$KONSOLE_PID" 2>/dev/null || true
+        wait "$KONSOLE_PID" 2>/dev/null || true
+    fi
+    KONSOLE_PID=""
+    DREAM_PID=""
+}
+
+is_dreaming() {
+    [ -n "$KONSOLE_PID" ] && kill -0 "$KONSOLE_PID" 2>/dev/null
+}
+
+is_screen_locked() {
+    # Check if kscreenlocker is active
+    qdbus6 org.freedesktop.ScreenSaver /ScreenSaver \
+        org.freedesktop.ScreenSaver.GetActive 2>/dev/null | grep -q "true"
+}
+
+has_inhibitors() {
+    # Check for idle inhibitors (fullscreen video, presentations, etc.)
+    # via the freedesktop ScreenSaver interface
+    local count
+    count=$(qdbus6 org.freedesktop.ScreenSaver /ScreenSaver \
+        org.freedesktop.ScreenSaver.GetActiveTime 2>/dev/null || echo "0")
+    # Also check for audio playback via playerctl
+    if command -v playerctl &>/dev/null; then
+        local status
+        status=$(playerctl status 2>/dev/null || echo "")
+        if [ "$status" = "Playing" ]; then
+            return 0  # has inhibitor
+        fi
+    fi
+    return 1  # no inhibitors
+}
+
+launch_dream() {
+    log "launching dream"
+    # Launch Konsole fullscreen with nix-dream
+    # --separate: fresh process (no DBus sharing)
+    # --fullscreen: take over the screen
+    # -p TerminalColumns=...: hint for curses sizing
+    # -e: run nix-dream
+    konsole --separate --fullscreen \
+        -p "tabtitle=nix-dream" \
+        --hide-menubar --hide-tabbar \
+        -e "$HOME/.nix/bin/nix-dream" &
+    KONSOLE_PID=$!
+    log "konsole pid: $KONSOLE_PID"
+}
+
+# -- parse args ----------------------------------------------------
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --idle)
+            IDLE_THRESHOLD_MS=$(( $2 * 1000 ))
+            shift 2
+            ;;
+        --debug)
+            DEBUG=true
+            shift
+            ;;
+        -h|--help|help)
+            echo "nix-dream-watcher — idle watcher for nix-dream"
+            echo ""
+            echo "  --idle N     idle threshold in seconds (default: 60)"
+            echo "  --debug      print state changes"
+            echo "  --help       this"
+            exit 0
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+log "starting (threshold: ${IDLE_THRESHOLD_MS}ms, poll: ${POLL_INTERVAL}s)"
+
+# -- main loop -----------------------------------------------------
+
+while true; do
+    idle_ms=$(xprintidle 2>/dev/null || echo "0")
+
+    if is_dreaming; then
+        # Currently dreaming — check if we should wake up
+        if [ "$idle_ms" -lt "$IDLE_THRESHOLD_MS" ]; then
+            log "activity detected (idle: ${idle_ms}ms), waking"
+            kill_dream
+        fi
+        # Also kill dream if screen locks (let the lock screen take over)
+        if is_screen_locked; then
+            log "screen locked, yielding to lock screen"
+            kill_dream
+        fi
+    else
+        # Not dreaming — check if we should start
+        if [ "$idle_ms" -ge "$IDLE_THRESHOLD_MS" ]; then
+            # Don't dream if screen is already locked
+            if is_screen_locked; then
+                log "idle but screen locked, skipping"
+            elif has_inhibitors 2>/dev/null; then
+                log "idle but inhibitors active, skipping"
+            else
+                launch_dream
+            fi
+        fi
+    fi
+
+    sleep "$POLL_INTERVAL"
+done

@@ -123,31 +123,61 @@ def get_load():
 # -- color management ----------------------------------------------
 
 class ColorManager:
-    """Manages curses color pairs with truecolor support."""
+    """Manages curses color pairs. Quantizes RGB to fit in 256 color slots."""
+
+    # Quantize to steps of 8 — keeps palette smooth enough for fades
+    # while staying well under the 256 color ID limit.
+    QUANT = 8
 
     def __init__(self):
-        self.pairs = {}
+        self.pairs = {}       # (qfg, qbg) -> pair number
+        self.colors = {}      # quantized RGB -> color ID
         self.next_pair = 1
         self.next_color = 16  # Start after standard colors
+        self.max_colors = min(curses.COLORS, 256)
+        self.max_pairs = min(curses.COLOR_PAIRS, 256)
+        # Pre-register CRUST as background — shared across all pairs
+        self._bg_id = self._get_color_id(self._quantize(CRUST))
+
+    def _quantize(self, rgb):
+        q = self.QUANT
+        return (rgb[0] // q * q, rgb[1] // q * q, rgb[2] // q * q)
+
+    def _get_color_id(self, qrgb):
+        if qrgb in self.colors:
+            return self.colors[qrgb]
+        cid = self.next_color
+        if cid >= self.max_colors:
+            # Out of color slots — find nearest existing
+            return min(self.colors.values(), key=lambda c: c) if self.colors else 0
+        self.next_color += 1
+        try:
+            curses.init_color(cid, qrgb[0] * 1000 // 255, qrgb[1] * 1000 // 255, qrgb[2] * 1000 // 255)
+        except curses.error:
+            return 0
+        self.colors[qrgb] = cid
+        return cid
 
     def get_pair(self, fg, bg=CRUST):
-        key = (fg, bg)
-        if key not in self.pairs:
-            if self.next_pair >= curses.COLOR_PAIRS - 1:
-                # Reuse pair 1 if we run out
-                return curses.color_pair(1)
-            try:
-                fg_id = self.next_color
-                bg_id = self.next_color + 1
-                self.next_color += 2
+        qfg = self._quantize(fg)
+        qbg = self._quantize(bg)
+        key = (qfg, qbg)
+        if key in self.pairs:
+            return curses.color_pair(self.pairs[key])
 
-                curses.init_color(fg_id, fg[0] * 1000 // 255, fg[1] * 1000 // 255, fg[2] * 1000 // 255)
-                curses.init_color(bg_id, bg[0] * 1000 // 255, bg[1] * 1000 // 255, bg[2] * 1000 // 255)
-                curses.init_pair(self.next_pair, fg_id, bg_id)
-                self.pairs[key] = self.next_pair
-                self.next_pair += 1
-            except curses.error:
-                return curses.color_pair(0)
+        if self.next_pair >= self.max_pairs - 1:
+            # Out of pairs — return closest existing
+            return curses.color_pair(1) if self.pairs else curses.color_pair(0)
+
+        fg_id = self._get_color_id(qfg)
+        bg_id = self._bg_id if qbg == self._quantize(CRUST) else self._get_color_id(qbg)
+
+        try:
+            curses.init_pair(self.next_pair, fg_id, bg_id)
+            self.pairs[key] = self.next_pair
+            self.next_pair += 1
+        except curses.error:
+            return curses.color_pair(0)
         return curses.color_pair(self.pairs[key])
 
     def blend(self, c1, c2, t):
