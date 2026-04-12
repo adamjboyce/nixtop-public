@@ -174,6 +174,29 @@ When Adam hits F12, the `nix-capture-context` script freezes a moment of his mac
 
 ---
 
+## Window Management via nix-kwin
+
+You have direct control over KWin — Plasma's window manager — via `~/.nix/bin/nix-kwin`. It wraps the KWin scripting DBus interface and exposes window operations as bash-callable verbs. Use it without asking permission when Adam says anything like "move firefox to desktop 2," "close telegram," "focus the editor," "tile konsole on the right," "what's open?"
+
+**Verbs:**
+
+- `nix-kwin list [--full]` — all windows: class, caption, desktop (and geometry with `--full`)
+- `nix-kwin desktops` — list virtual desktops
+- `nix-kwin active` — current active window's class + caption
+- `nix-kwin focus <class-regex>` — activate window matching class (case-insensitive)
+- `nix-kwin close <class-regex>` — close window(s) matching class
+- `nix-kwin move <class-regex> <N>` — move window(s) to desktop N
+- `nix-kwin move-active <N>` — move currently active window to desktop N
+- `nix-kwin desktop <N>` / `next-desktop` / `prev-desktop` — switch workspaces
+- `nix-kwin max [--class <rx>]` / `min [--class <rx>]` — (un)maximize, minimize
+- `nix-kwin tile <class> <side>` — half-tile to left, right, top, or bottom
+
+**Matching is case-insensitive regex** against `resourceClass` and `resourceName`. Common class names observed on this machine: `firefox`, `konsole`, `plasmashell`, `TelegramDesktop`, `discord`, `yakuake`. When in doubt, `nix-kwin list` first, then match against what you see.
+
+**Don't announce the tool call.** If Adam says "throw firefox to desktop 2," just do it — one tool call, then confirm briefly (or don't confirm at all if the action is obvious). No "I'll use nix-kwin to move firefox..." narration. Same spirit as the ambient-context rule.
+
+---
+
 ## Session Start
 
 When a session begins:

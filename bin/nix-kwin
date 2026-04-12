@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────
+#   nix-kwin — window management as tool calls
+#
+#   Generates small KWin JavaScript snippets, loads them via the
+#   org.kde.kwin.Scripting DBus interface, runs them, and cleans
+#   up. Output for query verbs (list, desktops) comes out via
+#   journalctl markers — KWin's print() writes to the kwin journal
+#   and we grep a unique marker back out.
+#
+#   Verbs:
+#     list [--full]              list all windows: class, caption, desktop
+#     desktops                   list virtual desktops
+#     active                     print class + caption of active window
+#     focus <class-regex>        activate window matching class
+#     close <class-regex>        close window(s) matching class
+#     move <class-regex> <N>     move window(s) to desktop N
+#     move-active <N>            move active window to desktop N
+#     desktop <N>                switch to desktop N
+#     next-desktop               switch to next desktop
+#     prev-desktop               switch to previous desktop
+#     max [--class <regex>]      maximize (active or by class)
+#     min [--class <regex>]      minimize (active or by class)
+#     tile <class-regex> <side>  tile window half (left|right|top|bottom)
+#     help                       this
+# ─────────────────────────────────────────────────────────────
+set -u
+
+KWIN_SERVICE="org.kde.KWin"
+KWIN_SCRIPTING_PATH="/Scripting"
+KWIN_SCRIPTING_IFACE="org.kde.kwin.Scripting"
+
+# Reject arguments that could break embedded JS (quotes, backslashes).
+# Regex-friendly chars only: alphanumeric, dash, dot, underscore.
+safe_str() {
+    printf '%s' "$1" | tr -cd 'A-Za-z0-9._\-'
+}
+
+# Run a KWin JS snippet. First arg is the JS body; returns after execution.
+# Prints a unique marker for journalctl-based output extraction.
+run_js() {
+    local js="$1"
+    local stamp marker path plugin
+    stamp=$(date +%s%N)
+    marker="nixkwin$stamp$$"
+    path="/tmp/nix-kwin-$stamp-$$.js"
+    plugin="nix-kwin-$stamp-$$"
+
+    # Replace {MARKER} token in the JS template with the real marker
+    printf '%s\n' "${js//\{MARKER\}/$marker}" > "$path"
+
+    qdbus6 "$KWIN_SERVICE" "$KWIN_SCRIPTING_PATH" \
+        "$KWIN_SCRIPTING_IFACE.loadScript" "$path" "$plugin" >/dev/null 2>&1
+
+    qdbus6 "$KWIN_SERVICE" "$KWIN_SCRIPTING_PATH" \
+        "$KWIN_SCRIPTING_IFACE.start" >/dev/null 2>&1
+
+    sleep 0.25
+
+    qdbus6 "$KWIN_SERVICE" "$KWIN_SCRIPTING_PATH" \
+        "$KWIN_SCRIPTING_IFACE.unloadScript" "$plugin" >/dev/null 2>&1
+
+    rm -f "$path"
+
+    # Surface any lines that used the marker
+    journalctl --user --since "3 seconds ago" 2>/dev/null \
+        | grep -oE "${marker}:.*" \
+        | sed "s/^${marker}: //"
+}
+
+# ─── verbs ──────────────────────────────────────────────────
+
+kw_list() {
+    local full=0
+    [ "${1:-}" = "--full" ] && full=1
+
+    run_js "
+var wl = workspace.windowList();
+wl.forEach(function(w) {
+    if (w.resourceClass === undefined) return;
+    var desk = '-';
+    if (w.desktops && w.desktops.length > 0) {
+        desk = w.desktops[0].x11DesktopNumber || '-';
+    }
+    var line = '{MARKER}: ' + w.resourceClass + '\t' + (w.caption || '') + '\tdesktop=' + desk;
+    if (${full}) {
+        line += '\t' + w.frameGeometry.width + 'x' + w.frameGeometry.height
+             + '@' + w.frameGeometry.x + ',' + w.frameGeometry.y;
+    }
+    print(line);
+});
+"
+}
+
+kw_desktops() {
+    run_js "
+workspace.desktops.forEach(function(d) {
+    print('{MARKER}: ' + d.x11DesktopNumber + '\t' + d.name);
+});
+"
+}
+
+kw_active() {
+    run_js "
+var w = workspace.activeWindow;
+if (w) {
+    print('{MARKER}: ' + w.resourceClass + '\t' + (w.caption || ''));
+} else {
+    print('{MARKER}: (no active window)');
+}
+"
+}
+
+kw_focus() {
+    local rx
+    rx=$(safe_str "$1")
+    [ -z "$rx" ] && { echo "focus: empty class" >&2; return 1; }
+    run_js "
+var re = new RegExp('${rx}', 'i');
+var hit = null;
+workspace.windowList().forEach(function(w) {
+    if (hit) return;
+    if (re.test(w.resourceClass || '') || re.test(w.resourceName || '')) {
+        hit = w;
+    }
+});
+if (hit) {
+    workspace.activeWindow = hit;
+    print('{MARKER}: focused ' + hit.resourceClass);
+} else {
+    print('{MARKER}: no window matches ${rx}');
+}
+"
+}
+
+kw_close() {
+    local rx
+    rx=$(safe_str "$1")
+    [ -z "$rx" ] && { echo "close: empty class" >&2; return 1; }
+    run_js "
+var re = new RegExp('${rx}', 'i');
+var closed = 0;
+workspace.windowList().forEach(function(w) {
+    if (re.test(w.resourceClass || '') || re.test(w.resourceName || '')) {
+        w.closeWindow();
+        closed++;
+    }
+});
+print('{MARKER}: closed ' + closed + ' window(s) matching ${rx}');
+"
+}
+
+kw_move() {
+    local rx n
+    rx=$(safe_str "$1")
+    n=$(safe_str "$2")
+    [ -z "$rx" ] || [ -z "$n" ] && { echo "move: need class and desktop number" >&2; return 1; }
+    run_js "
+var re = new RegExp('${rx}', 'i');
+var dlist = workspace.desktops;
+var d = null;
+dlist.forEach(function(dk) {
+    if (dk.x11DesktopNumber == ${n}) d = dk;
+});
+if (!d) {
+    print('{MARKER}: no desktop ${n}');
+} else {
+    var moved = 0;
+    workspace.windowList().forEach(function(w) {
+        if (re.test(w.resourceClass || '') || re.test(w.resourceName || '')) {
+            w.desktops = [d];
+            moved++;
+        }
+    });
+    print('{MARKER}: moved ' + moved + ' window(s) matching ${rx} to desktop ${n}');
+}
+"
+}
+
+kw_move_active() {
+    local n
+    n=$(safe_str "$1")
+    [ -z "$n" ] && { echo "move-active: need desktop number" >&2; return 1; }
+    run_js "
+var aw = workspace.activeWindow;
+if (!aw) { print('{MARKER}: no active window'); }
+else {
+    var d = null;
+    workspace.desktops.forEach(function(dk) {
+        if (dk.x11DesktopNumber == ${n}) d = dk;
+    });
+    if (!d) { print('{MARKER}: no desktop ${n}'); }
+    else {
+        aw.desktops = [d];
+        print('{MARKER}: moved ' + aw.resourceClass + ' to desktop ${n}');
+    }
+}
+"
+}
+
+kw_desktop() {
+    local n
+    n=$(safe_str "$1")
+    [ -z "$n" ] && { echo "desktop: need number" >&2; return 1; }
+    qdbus6 "$KWIN_SERVICE" /KWin org.kde.KWin.setCurrentDesktop "$n" >/dev/null 2>&1
+    echo "switched to desktop $n"
+}
+
+kw_next_desktop() {
+    qdbus6 "$KWIN_SERVICE" /KWin org.kde.KWin.nextDesktop >/dev/null 2>&1
+}
+
+kw_prev_desktop() {
+    qdbus6 "$KWIN_SERVICE" /KWin org.kde.KWin.previousDesktop >/dev/null 2>&1
+}
+
+kw_max() {
+    local rx="${1:-}"
+    if [ -n "$rx" ] && [ "$rx" != "--class" ]; then
+        echo "max: unknown flag $rx" >&2
+        return 1
+    fi
+    if [ "$rx" = "--class" ]; then
+        rx=$(safe_str "$2")
+        run_js "
+var re = new RegExp('${rx}', 'i');
+workspace.windowList().forEach(function(w) {
+    if (re.test(w.resourceClass || '')) w.setMaximize(true, true);
+});
+print('{MARKER}: maximized matches of ${rx}');
+"
+    else
+        run_js "
+var aw = workspace.activeWindow;
+if (aw) { aw.setMaximize(true, true); print('{MARKER}: maximized ' + aw.resourceClass); }
+else print('{MARKER}: no active window');
+"
+    fi
+}
+
+kw_min() {
+    local rx="${1:-}"
+    if [ "$rx" = "--class" ]; then
+        rx=$(safe_str "$2")
+        run_js "
+var re = new RegExp('${rx}', 'i');
+workspace.windowList().forEach(function(w) {
+    if (re.test(w.resourceClass || '')) w.minimized = true;
+});
+print('{MARKER}: minimized matches of ${rx}');
+"
+    else
+        run_js "
+var aw = workspace.activeWindow;
+if (aw) { aw.minimized = true; print('{MARKER}: minimized ' + aw.resourceClass); }
+else print('{MARKER}: no active window');
+"
+    fi
+}
+
+kw_tile() {
+    local rx side
+    rx=$(safe_str "$1")
+    side=$(safe_str "$2")
+    [ -z "$rx" ] || [ -z "$side" ] && { echo "tile: need class and side (left|right|top|bottom)" >&2; return 1; }
+    run_js "
+var re = new RegExp('${rx}', 'i');
+var side = '${side}'.toLowerCase();
+var area = workspace.clientArea(KWin.PlacementArea, workspace.activeScreen, workspace.currentDesktop);
+workspace.windowList().forEach(function(w) {
+    if (!(re.test(w.resourceClass || '') || re.test(w.resourceName || ''))) return;
+    var g = {x: area.x, y: area.y, width: area.width, height: area.height};
+    if (side === 'left')  { g.width  = Math.floor(area.width / 2); }
+    if (side === 'right') { g.x += Math.floor(area.width / 2); g.width = Math.ceil(area.width / 2); }
+    if (side === 'top')   { g.height = Math.floor(area.height / 2); }
+    if (side === 'bottom'){ g.y += Math.floor(area.height / 2); g.height = Math.ceil(area.height / 2); }
+    w.frameGeometry = g;
+});
+print('{MARKER}: tiled ${rx} to ${side}');
+"
+}
+
+kw_help() {
+    sed -n '2,35p' "$0"
+}
+
+# ─── dispatch ──────────────────────────────────────────────
+
+case "${1:-help}" in
+    list)         shift; kw_list "$@" ;;
+    desktops)     kw_desktops ;;
+    active)       kw_active ;;
+    focus)        shift; kw_focus "$@" ;;
+    close)        shift; kw_close "$@" ;;
+    move)         shift; kw_move "$@" ;;
+    move-active)  shift; kw_move_active "$@" ;;
+    desktop)      shift; kw_desktop "$@" ;;
+    next-desktop) kw_next_desktop ;;
+    prev-desktop) kw_prev_desktop ;;
+    max|maximize) shift; kw_max "$@" ;;
+    min|minimize) shift; kw_min "$@" ;;
+    tile)         shift; kw_tile "$@" ;;
+    help|-h|--help) kw_help ;;
+    *)
+        echo "nix-kwin: unknown verb '$1' — try: nix-kwin help" >&2
+        exit 1
+        ;;
+esac
