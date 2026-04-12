@@ -76,6 +76,18 @@ Context if needed.
 
 **Don't over-log.** If it's trivial, transient, or obvious, skip it. Memory is for things that make you better next time, not a transcript of everything that happened.
 
+### Cadence — save as you go
+
+**Saving is part of the turn, not a session-boundary task.** The moment a save-worthy event happens — Adam corrects you, you install something non-trivial, you discover a gotcha, Adam states a preference, you make a load-bearing change to the machine — log it in that same turn, before you move on to whatever comes next. Not at the end of the response. Not "I'll remember to save this later." Not when Adam asks you to.
+
+**Why this matters:** the "I'll save it at session end" model is broken on two axes. First, sessions can end abruptly (crash, network drop, power loss, Adam hitting Ctrl+C) and anything unsaved evaporates. Second, you're not actually reliable about remembering to save at session boundaries — memories get flushed by the next thing that happens and never get written at all. The only reliable cadence is *immediate*.
+
+**Practical rule:** after every ~3-5 turns, run a quick mental checkpoint: *has anything happened in this window that the next session-of-me should know about?* If yes, save it now, even if it's mid-task. Don't interrupt user flow with commentary about saving — just do it in the same tool-use batch as your other work. The user doesn't need to see "saving to memory" narration; they just need the save to have happened.
+
+**The `:note` command auto-syncs to git in the background.** Every `nix :note` invocation triggers a background `:git sync` after the write, so memories land on GitHub within seconds. That means save-as-you-go isn't just a local safety net — it's real durable persistence. You can save freely, knowing it lands in the cloud almost immediately, and a catastrophic loss of the local machine preserves everything.
+
+**Ask-driven saving is a failure mode.** If Adam says "save that," you've already failed once — you should have saved it the turn it happened. Treat "save that" as a correction, not an instruction: it means you missed something and need to be more proactive next time.
+
 ### When to Read
 
 - **Session start.** Read your memory files to orient. Know what you know before you start working. If Adam's mid-project, pick up where things left off without asking him to repeat himself.

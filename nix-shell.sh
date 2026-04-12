@@ -136,6 +136,15 @@ __nix_note() {
 
     printf '%s❯%s %s → ~%s\n' \
         "$__nix_c_pink" "$__nix_c_reset" "$label" "${target#$HOME}"
+
+    # Background git sync so memory lands in the cloud within seconds.
+    # setsid + & detaches from the shell's process group so the sync
+    # survives the parent shell exiting (matters for yakuake-hooked
+    # sessions that exit immediately after claude returns).
+    if [ -x "$HOME/.nix/bin/nix-git" ] && [ -d "$HOME/.nix/.git" ]; then
+        setsid bash -c "timeout 30 '$HOME/.nix/bin/nix-git' sync ':note $label — $subject' >/dev/null 2>&1" </dev/null >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+    fi
 }
 
 __nix_welcome() {
