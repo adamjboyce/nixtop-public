@@ -8,7 +8,7 @@ import org.kde.kirigami as Kirigami
 
 Rectangle {
     id: root
-    color: "#11111b"
+    color: "#000000"
 
     property int stage
 
@@ -18,8 +18,6 @@ Rectangle {
     onStageChanged: {
         if (stage === 2) {
             introAnimation.running = true;
-        } else if (stage === 5) {
-            outroAnimation.running = true;
         }
     }
 
@@ -52,17 +50,7 @@ Rectangle {
         target: greeting
         from: 0
         to: 1
-        duration: Kirigami.Units.veryLongDuration * 2
-        easing.type: Easing.InOutQuad
-    }
-
-    OpacityAnimator {
-        id: outroAnimation
-        running: false
-        target: greeting
-        from: 1
-        to: 0
-        duration: Kirigami.Units.veryLongDuration
+        duration: Kirigami.Units.longDuration
         easing.type: Easing.InOutQuad
     }
 }
