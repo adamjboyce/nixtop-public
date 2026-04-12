@@ -81,12 +81,18 @@ launch_dream() {
     # --fullscreen: take over the screen
     # -p TerminalColumns=...: hint for curses sizing
     # -e: run nix-dream
-    konsole --separate --fullscreen \
-        -p "tabtitle=nix-dream" \
-        --hide-menubar --hide-tabbar \
+    # xterm: zero chrome, fullscreen, no scrollbar, truecolor-capable
+    # xterm: zero chrome, fullscreen, no scrollbar, hidden mouse cursor
+    xterm -fullscreen -title "nix-dream" \
+        -bg "#11111b" -fg "#cdd6f4" \
+        -fa "Hack" -fs 10 \
+        +sb -b 0 \
+        -xrm "xterm*pointerShape: dot" \
+        -xrm "xterm*pointerColor: #11111b" \
+        -xrm "xterm*pointerColorBackground: #11111b" \
         -e "$HOME/.nix/bin/nix-dream" &
     KONSOLE_PID=$!
-    log "konsole pid: $KONSOLE_PID"
+    log "xterm pid: $KONSOLE_PID"
 }
 
 # -- parse args ----------------------------------------------------
