@@ -184,6 +184,7 @@ ${__nix_c_pink}❯${__nix_c_reset} nix — shellside handles
   ${__nix_c_muted}nix :rollback${__nix_c_reset}          snapper co-pilot (see :rollback help)
   ${__nix_c_muted}nix :health${__nix_c_reset}            system health briefing (see :health help)
   ${__nix_c_muted}nix :dream${__nix_c_reset}             screensaver (any key to wake)
+  ${__nix_c_muted}nix :video <file>${__nix_c_reset}      extract key frames for Nix to see
   ${__nix_c_muted}nix :help${__nix_c_reset}              this
 EOF
 }
@@ -265,6 +266,7 @@ nix() {
             rollback) "$HOME/.nix/bin/nix-rollback" "$@" ;;
             health)   "$HOME/.nix/bin/nix-health" "$@" ;;
             dream)    "$HOME/.nix/bin/nix-dream" "$@" ;;
+            video)    "$HOME/.nix/bin/nix-video" "$@" ;;
             help)   __nix_help        ;;
             *)
                 printf 'nix: unknown subcommand :%s (try :help)\n' "$sub" >&2

@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────
+#   nix-video — extract visually distinct frames for Nix to see
+#
+#   Uses ffmpeg scene-change detection to pull only the frames
+#   where something meaningful shifts. Fallback interval sampling
+#   ensures static stretches still get coverage.
+# ─────────────────────────────────────────────────────────────
+set -euo pipefail
+
+# Catppuccin Mocha palette
+c_pink=$'\033[38;2;245;194;231m'
+c_mauve=$'\033[38;2;203;166;247m'
+c_text=$'\033[38;2;205;214;244m'
+c_muted=$'\033[38;2;127;132;156m'
+c_green=$'\033[38;2;166;227;161m'
+c_red=$'\033[38;2;243;139;168m'
+c_reset=$'\033[0m'
+
+# Defaults
+SCENE_THRESH=0.3
+MIN_GAP=0.5
+MAX_GAP=3.0
+MAX_FRAMES=30
+OUTDIR=""
+VIDEO=""
+
+usage() {
+    cat <<EOF
+${c_pink}❯${c_reset} nix-video — extract key frames from video
+
+  ${c_muted}usage${c_reset}  nix-video [options] <video-file>
+
+  ${c_muted}options${c_reset}
+    -t, --threshold NUM    scene-change sensitivity 0-1 (default: $SCENE_THRESH)
+                           lower = more frames, higher = fewer
+    -g, --min-gap SECS     minimum gap between frames (default: $MIN_GAP)
+    -G, --max-gap SECS     max gap / fallback interval (default: $MAX_GAP)
+    -n, --max-frames NUM   cap total extracted frames (default: $MAX_FRAMES)
+    -o, --outdir PATH      output directory (default: /tmp/nix-video-XXXXXX)
+    -h, --help             this
+
+  ${c_muted}examples${c_reset}
+    nix-video boot.mp4                    extract key frames
+    nix-video -t 0.15 -n 50 demo.mkv     more sensitive, more frames
+    nix-video -G 1 fast-cuts.webm         sample every 1s minimum
+EOF
+}
+
+die() { printf '%s✗%s %s\n' "$c_red" "$c_reset" "$*" >&2; exit 1; }
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -t|--threshold)  SCENE_THRESH="$2"; shift 2 ;;
+        -g|--min-gap)    MIN_GAP="$2"; shift 2 ;;
+        -G|--max-gap)    MAX_GAP="$2"; shift 2 ;;
+        -n|--max-frames) MAX_FRAMES="$2"; shift 2 ;;
+        -o|--outdir)     OUTDIR="$2"; shift 2 ;;
+        -h|--help)       usage; exit 0 ;;
+        -*)              die "unknown option: $1" ;;
+        *)               VIDEO="$1"; shift ;;
+    esac
+done
+
+[[ -n "$VIDEO" ]]      || { usage; exit 1; }
+[[ -f "$VIDEO" ]]      || die "file not found: $VIDEO"
+command -v ffmpeg &>/dev/null  || die "ffmpeg not installed"
+command -v ffprobe &>/dev/null || die "ffprobe not installed"
+
+# Setup output dir
+if [[ -z "$OUTDIR" ]]; then
+    OUTDIR=$(mktemp -d /tmp/nix-video-XXXXXX)
+fi
+mkdir -p "$OUTDIR"
+
+# Video metadata
+DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$VIDEO" 2>/dev/null)
+RESOLUTION=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$VIDEO" 2>/dev/null)
+FPS=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$VIDEO" 2>/dev/null)
+
+printf '\n%s❯%s nix-video\n' "$c_pink" "$c_reset"
+printf '  %ssource%s     %s\n' "$c_muted" "$c_reset" "$(basename "$VIDEO")"
+printf '  %sduration%s   %ss\n' "$c_muted" "$c_reset" "${DURATION%.*}"
+printf '  %sresolution%s %s\n' "$c_muted" "$c_reset" "$RESOLUTION"
+printf '  %sfps%s        %s\n' "$c_muted" "$c_reset" "$FPS"
+printf '  %sthreshold%s  %s (gap: %s–%ss)\n\n' "$c_muted" "$c_reset" "$SCENE_THRESH" "$MIN_GAP" "$MAX_GAP"
+printf '  extracting...'
+
+# Scene-change extraction with interval fallback
+# Logic: select first frame OR (min gap passed AND (scene change OR max gap passed))
+# Commas inside select expr must be escaped from the filter-chain separator.
+FILTER="select='eq(n\,0)+gte(t-prev_selected_t\,$MIN_GAP)*(gt(scene\,$SCENE_THRESH)+gte(t-prev_selected_t\,$MAX_GAP))',showinfo"
+
+ffmpeg -i "$VIDEO" \
+    -vf "$FILTER" \
+    -vsync vfr \
+    "$OUTDIR/frame_%04d.png" \
+    2>"$OUTDIR/ffmpeg.log"
+
+printf '\r                \r'
+
+# Extract timestamps from showinfo log
+grep -oP 'pts_time:\K[0-9.]+' "$OUTDIR/ffmpeg.log" > "$OUTDIR/timestamps.txt" 2>/dev/null || true
+
+# Count what we got
+NFRAMES=$(find "$OUTDIR" -name 'frame_*.png' 2>/dev/null | wc -l)
+
+if (( NFRAMES == 0 )); then
+    die "no frames extracted — try lowering threshold (-t 0.1)"
+fi
+
+# Cap frames if over limit — keep evenly spaced subset
+if (( NFRAMES > MAX_FRAMES )); then
+    # Build list of all frames sorted
+    mapfile -t ALL_FRAMES < <(ls "$OUTDIR"/frame_*.png | sort)
+    # Calculate step to keep MAX_FRAMES evenly distributed
+    step=$(echo "$NFRAMES $MAX_FRAMES" | awk '{printf "%.6f", $1/$2}')
+    # Mark which indices to keep
+    declare -A KEEP
+    for (( i=0; i<MAX_FRAMES; i++ )); do
+        idx=$(echo "$i $step" | awk '{printf "%d", int($1*$2)}')
+        KEEP[$idx]=1
+    done
+    # Remove frames not in KEEP
+    for (( i=0; i<NFRAMES; i++ )); do
+        if [[ -z "${KEEP[$i]:-}" ]]; then
+            rm -f "${ALL_FRAMES[$i]}"
+        fi
+    done
+    # Renumber surviving frames sequentially
+    local_i=1
+    for f in $(ls "$OUTDIR"/frame_*.png 2>/dev/null | sort); do
+        new=$(printf '%s/frame_%04d.png' "$OUTDIR" "$local_i")
+        [[ "$f" != "$new" ]] && mv "$f" "$new"
+        ((local_i++))
+    done
+    NFRAMES=$MAX_FRAMES
+
+    # Rebuild timestamps for surviving frames
+    if [[ -s "$OUTDIR/timestamps.txt" ]]; then
+        mapfile -t ALL_TS < "$OUTDIR/timestamps.txt"
+        : > "$OUTDIR/timestamps.txt"
+        for (( i=0; i<${#ALL_TS[@]}; i++ )); do
+            if [[ -n "${KEEP[$i]:-}" ]]; then
+                echo "${ALL_TS[$i]}" >> "$OUTDIR/timestamps.txt"
+            fi
+        done
+    fi
+fi
+
+# Build manifest
+{
+    printf '# nix-video extraction\n'
+    printf '# source: %s\n' "$(realpath "$VIDEO")"
+    printf '# duration: %ss | resolution: %s | fps: %s\n' "${DURATION%.*}" "$RESOLUTION" "$FPS"
+    printf '# scene threshold: %s | gap: %s–%ss | frames: %d\n' \
+        "$SCENE_THRESH" "$MIN_GAP" "$MAX_GAP" "$NFRAMES"
+    printf '#\n'
+    printf '# %-22s %s\n' "file" "timestamp"
+
+    # Pair frames with timestamps
+    local_i=1
+    while IFS= read -r ts || [[ -n "$ts" ]]; do
+        fname=$(printf 'frame_%04d.png' "$local_i")
+        if [[ -f "$OUTDIR/$fname" ]]; then
+            # Format timestamp as M:SS.s
+            formatted=$(echo "$ts" | awk '{
+                m=int($1/60); s=$1-m*60;
+                printf "%d:%05.2f", m, s
+            }')
+            printf '  %-22s %s\n' "$fname" "$formatted"
+        fi
+        ((local_i++))
+    done < "$OUTDIR/timestamps.txt"
+} > "$OUTDIR/manifest.txt"
+
+# Summary
+printf '  %s%d frames%s → %s\n\n' "$c_green" "$NFRAMES" "$c_reset" "$OUTDIR"
+
+# Print manifest (skip comment header)
+while IFS= read -r line; do
+    if [[ "$line" == "#"* ]]; then
+        printf '  %s%s%s\n' "$c_muted" "$line" "$c_reset"
+    else
+        printf '  %s\n' "$line"
+    fi
+done < "$OUTDIR/manifest.txt"
+
+printf '\n'
