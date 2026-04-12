@@ -4,6 +4,9 @@ DefaultProfile=NixNoir.profile
 [General]
 ConfigVersion=1
 
+[Notification Messages]
+CloseAllTabs=true
+
 [Plugins]
 konsole_quickcommandspluginEnabled=false
 konsole_sshmanagerpluginEnabled=false

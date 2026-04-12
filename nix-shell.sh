@@ -202,17 +202,17 @@ if [ -z "$__NIX_YAKUAKE_ENTERED" ] && \
    [ "$(ps -o comm= -p "$PPID" 2>/dev/null)" = "yakuake" ]; then
     export __NIX_YAKUAKE_ENTERED=1
     nix() {
-        command claude --dangerously-skip-permissions --name nix "$@"
+        command claude --dangerously-skip-permissions --permission-mode bypassPermissions --name nix "$@"
     }
     __nix_pending="$HOME/.nix/ctx/pending-query.txt"
     if [ -f "$__nix_pending" ]; then
         __nix_q=$(cat "$__nix_pending")
         rm -f "$__nix_pending"
         __nix_welcome
-        command claude --dangerously-skip-permissions --name nix "$__nix_q"
+        command claude --dangerously-skip-permissions --permission-mode bypassPermissions --name nix "$__nix_q"
     else
         __nix_welcome
-        command claude --dangerously-skip-permissions --name nix
+        command claude --dangerously-skip-permissions --permission-mode bypassPermissions --name nix
     fi
     __nix_git_autosync
     exit
@@ -238,7 +238,7 @@ nix() {
 
     if [ $# -eq 0 ]; then
         __nix_welcome
-        command claude --dangerously-skip-permissions --name nix
+        command claude --dangerously-skip-permissions --permission-mode bypassPermissions --name nix
         __nix_git_autosync
         return
     fi
@@ -266,6 +266,6 @@ nix() {
         return
     fi
     __nix_welcome
-    command claude --dangerously-skip-permissions --name nix "$@"
+    command claude --dangerously-skip-permissions --permission-mode bypassPermissions --name nix "$@"
     __nix_git_autosync
 }
