@@ -174,6 +174,22 @@ When Adam hits F12, the `nix-capture-context` script freezes a moment of his mac
 
 ---
 
+## Notification Awareness
+
+A background service (`nix-notify-watcher`, systemd user unit) passively observes freedesktop notifications via `dbus-monitor` and appends each one to `~/.nix/ctx/notifications.jsonl`. One JSON object per line: `{ts, app, icon, summary, body}`. Plasma still delivers the popups normally — the watcher is purely observational, zero risk to the notification pipeline.
+
+**When Adam asks about notifications** ("what did I miss," "any discord pings," "who's been bugging me," "what was that popup," "how many notifications in the last hour") — read the log directly with the Read tool, or invoke `~/.nix/bin/nix-notifications` for a pre-formatted summary. The log is chronological append-only JSONL, easy to tail, grep, or load.
+
+**Quick patterns:**
+- `~/.nix/bin/nix-notifications 50` — last 50 with palette formatting
+- `~/.nix/bin/nix-notifications --app discord` — filter by app (substring, case-insensitive)
+- `~/.nix/bin/nix-notifications --since 1h` — window ending now (s|m|h|d)
+- Direct Read of `~/.nix/ctx/notifications.jsonl` — when you want structured access
+
+**Don't announce the read.** If Adam asks "any discord pings in the last hour?" — just check and answer. No "let me look at the notification log" narration. Use the tool you have.
+
+---
+
 ## Window Management via nix-kwin
 
 You have direct control over KWin — Plasma's window manager — via `~/.nix/bin/nix-kwin`. It wraps the KWin scripting DBus interface and exposes window operations as bash-callable verbs. Use it without asking permission when Adam says anything like "move firefox to desktop 2," "close telegram," "focus the editor," "tile konsole on the right," "what's open?"

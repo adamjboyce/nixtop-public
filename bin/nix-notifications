@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+# ─────────────────────────────────────────────────────────────
+#   nix-notifications — reader for the notification log
+#
+#   Reads ~/.nix/ctx/notifications.jsonl and prints recent entries
+#   with nix-noir palette formatting. Companion to the background
+#   watcher (nix-notify-watcher).
+#
+#   Usage:
+#     nix-notifications [N]              show last N (default 20)
+#     nix-notifications --app <name>     filter by app (case-insensitive)
+#     nix-notifications --since <dur>    filter to window ending now
+#                                          (e.g. 10m, 1h, 2d)
+#     nix-notifications help             this
+# ─────────────────────────────────────────────────────────────
+
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime
+
+LOG_PATH = os.path.expanduser("~/.nix/ctx/notifications.jsonl")
+
+# Catppuccin Mocha truecolor
+C_PINK = "\033[38;2;245;194;231m"
+C_MAUVE = "\033[38;2;203;166;247m"
+C_TEXT = "\033[38;2;205;214;244m"
+C_MUTED = "\033[38;2;127;132;156m"
+C_GREEN = "\033[38;2;166;227;161m"
+C_RESET = "\033[0m"
+
+DUR_RE = re.compile(r"^(\d+)([smhd])$")
+
+
+def parse_duration(s):
+    m = DUR_RE.match(s)
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2)
+    return n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+
+
+def read_entries():
+    if not os.path.exists(LOG_PATH):
+        return []
+    out = []
+    with open(LOG_PATH, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue
+    return out
+
+
+def fmt_time(ts):
+    now = time.time()
+    dt = datetime.fromtimestamp(ts)
+    if now - ts < 86400:
+        return dt.strftime("%H:%M:%S")
+    return dt.strftime("%m-%d %H:%M")
+
+
+def print_entries(entries):
+    if not entries:
+        print(f"  {C_MUTED}(no notifications logged){C_RESET}")
+        return
+    for e in entries:
+        ts = fmt_time(e.get("ts", 0))
+        app = (e.get("app") or "?").strip()[:18]
+        summary = (e.get("summary") or "").strip()
+        body = (e.get("body") or "").strip()
+        print(
+            f"  {C_MUTED}{ts}{C_RESET}  "
+            f"{C_MAUVE}{app:<18}{C_RESET}  "
+            f"{C_PINK}❯{C_RESET} {C_TEXT}{summary}{C_RESET}"
+        )
+        if body:
+            # Wrap body lines to avoid terminal overflow — hard-wrap at 80
+            for part in body.split("\n"):
+                part = part.strip()
+                if not part:
+                    continue
+                print(f"              {C_MUTED}{part[:100]}{C_RESET}")
+
+
+def print_help():
+    print(f"{C_PINK}❯{C_RESET} nix :notifications — reader for the notification log\n")
+    print(f"  {C_MUTED}:notifications [N]{C_RESET}         show last N (default 20)")
+    print(f"  {C_MUTED}:notifications --app X{C_RESET}     filter by app (case-insensitive substring)")
+    print(f"  {C_MUTED}:notifications --since 10m{C_RESET} filter to last 10m (s|m|h|d)")
+    print(f"  {C_MUTED}:notifications help{C_RESET}        this")
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("help", "-h", "--help"):
+        print_help()
+        return
+
+    limit = 20
+    app_filter = None
+    since_secs = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--app" and i + 1 < len(args):
+            app_filter = args[i + 1].lower()
+            i += 2
+            continue
+        if a == "--since" and i + 1 < len(args):
+            since_secs = parse_duration(args[i + 1])
+            i += 2
+            continue
+        if a.isdigit():
+            limit = int(a)
+            i += 1
+            continue
+        i += 1
+
+    entries = read_entries()
+
+    if app_filter:
+        entries = [e for e in entries if app_filter in (e.get("app") or "").lower()]
+
+    if since_secs is not None:
+        cutoff = time.time() - since_secs
+        entries = [e for e in entries if e.get("ts", 0) >= cutoff]
+
+    # Tail to last N
+    entries = entries[-limit:]
+
+    print(f"{C_PINK}❯{C_RESET} notifications — last {len(entries)}")
+    print_entries(entries)
+
+
+if __name__ == "__main__":
+    main()

@@ -169,6 +169,7 @@ ${__nix_c_pink}❯${__nix_c_reset} nix — shellside handles
   ${__nix_c_muted}nix :snap now [desc]${__nix_c_reset}   take a manual snapshot
   ${__nix_c_muted}nix :note "..."${__nix_c_reset}        append to memory (see :note help)
   ${__nix_c_muted}nix :git${__nix_c_reset}               cloud-synced state (see :git help)
+  ${__nix_c_muted}nix :notif [N]${__nix_c_reset}         recent notifications (see :notif help)
   ${__nix_c_muted}nix :help${__nix_c_reset}              this
 EOF
 }
@@ -240,6 +241,8 @@ nix() {
             snap)   __nix_snap   "$@" ;;
             note)   __nix_note   "$@" ;;
             git)    "$HOME/.nix/bin/nix-git" "$@" ;;
+            notifications|notif)
+                    "$HOME/.nix/bin/nix-notifications" "$@" ;;
             help)   __nix_help        ;;
             *)
                 printf 'nix: unknown subcommand :%s (try :help)\n' "$sub" >&2

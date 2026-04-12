@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+# ─────────────────────────────────────────────────────────────
+#   nix-notify-watcher — passive notification observer
+#
+#   Subprocesses dbus-monitor on the session bus, filtering for
+#   org.freedesktop.Notifications.Notify method calls, parses the
+#   multi-line output into structured records, and appends each
+#   to ~/.nix/ctx/notifications.jsonl as one JSON object per line.
+#
+#   Purely observational — we never claim the bus name, never
+#   block or modify notifications. Plasma's own notification
+#   daemon keeps doing its thing; we just also see the traffic.
+#
+#   Run as a long-lived systemd user service (see
+#   ~/.config/systemd/user/nix-notify-watcher.service). On any
+#   dbus-monitor exit, the systemd unit restarts us.
+# ─────────────────────────────────────────────────────────────
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+LOG_PATH = os.path.expanduser("~/.nix/ctx/notifications.jsonl")
+os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+
+STRING_RE = re.compile(r'^\s*string "((?:[^"\\]|\\.)*)"\s*$')
+INT32_RE = re.compile(r'^\s*int32 \-?\d+\s*$')
+METHOD_CALL_RE = re.compile(r'method call .* member=Notify')
+
+
+def unescape(s):
+    # dbus-monitor escapes " and \
+    return s.replace('\\"', '"').replace('\\\\', '\\')
+
+
+def stream_notifications(proc):
+    """Yield dicts parsed from dbus-monitor stdout."""
+    state = "IDLE"
+    strings = []
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        if state == "IDLE":
+            if METHOD_CALL_RE.search(line):
+                state = "COLLECT"
+                strings = []
+            continue
+        # state == COLLECT
+        m = STRING_RE.match(line)
+        if m:
+            strings.append(unescape(m.group(1)))
+            continue
+        if INT32_RE.match(line):
+            # int32 (timeout) marks end of Notify call
+            state = "IDLE"
+            # First four string values in order are: app, icon, summary, body.
+            # Array contents (actions, hints) appear after and may add more
+            # strings, which we ignore.
+            if len(strings) >= 4:
+                yield {
+                    "ts": time.time(),
+                    "app": strings[0],
+                    "icon": strings[1],
+                    "summary": strings[2],
+                    "body": strings[3],
+                }
+
+
+def main():
+    proc = subprocess.Popen(
+        [
+            "dbus-monitor",
+            "--session",
+            "interface='org.freedesktop.Notifications',member='Notify'",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,  # line-buffered
+    )
+
+    try:
+        for entry in stream_notifications(proc):
+            try:
+                with open(LOG_PATH, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except Exception as e:
+                print(f"write error: {e}", file=sys.stderr, flush=True)
+    finally:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
