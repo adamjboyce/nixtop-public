@@ -88,6 +88,97 @@ Bash wrapper over KWin's `org.kde.kwin.Scripting` DBus interface. Generates KWin
 
 ---
 
+## Health — `~/.nix/bin/nix-health`
+
+System health briefing — the "open your eyes" command. Runs all checks in parallel for speed, reports a single prioritized view of the machine state.
+
+**Commands:**
+| Flag | What |
+|------|------|
+| `nix-health` | Full briefing (all 7 sections) |
+| `nix-health --quick` | Skip slow checks (zypper update query) |
+| `nix-health --json` | Structured JSON output (for Claude) |
+| `nix-health --section X` | Run only one section |
+
+**Shell:** `nix :health [flags]`
+
+**Sections:** system, resources, services, network, updates, errors, snapshots
+
+**What it checks:**
+- **system** — hostname, kernel, uptime, load (colored by core count)
+- **resources** — memory, swap, disk, thermals (hottest zone), battery
+- **services** — failed systemd units
+- **network** — active interfaces, IP addresses, DNS
+- **updates** — pending zypper packages, highlights notable ones (kernel, plasma, mesa, etc.)
+- **errors** — journal error summary since boot with top offending units
+- **snapshots** — count and date range from snapper
+
+**Thresholds:** values are color-coded green/yellow/red based on configurable thresholds (e.g., memory >70%/90%, disk >80%/95%, temp >70°C/85°C, load >0.7x/0.9x cores).
+
+**Session-start use:** Run `:health --quick` at conversation start for a fast orientation. Run full `:health` before risky operations (zypper dup, config changes) to establish baseline.
+
+---
+
+## Triage — `~/.nix/bin/nix-triage`
+
+Error scanner that surfaces what's broken. Pulls from journalctl (system + kernel) and coredumpctl, deduplicates repeated messages, color-codes by severity, and prints a prioritized summary.
+
+**Commands:**
+| Flag | What |
+|------|------|
+| `nix-triage` | Last hour, errors and above |
+| `nix-triage --since 30m` | Custom time window (s\|m\|h\|d) |
+| `nix-triage --since boot` | Everything since last boot |
+| `nix-triage --unit <name>` | Filter by systemd unit |
+| `nix-triage --source <s>` | `journal` \| `kernel` \| `coredump` |
+| `nix-triage --priority <p>` | Max priority: 0-7 or name (emerg..debug) |
+| `nix-triage --full` | No message truncation |
+| `nix-triage --json` | Structured JSON output (for Claude) |
+
+**Shell:** `nix :triage [flags]`
+
+**Sources:**
+- **journal** — systemd journal via `journalctl -o json`, priority-filtered
+- **kernel** — kernel ring buffer via `journalctl -k` (avoids dmesg sudo requirement)
+- **coredump** — crash dumps via `coredumpctl list`
+
+**Dedup:** identical (source, unit, priority, message) entries collapse into one with a count. Sorted by severity then recency.
+
+---
+
+## Rollback — `~/.nix/bin/nix-rollback`
+
+Snapper co-pilot. Browse snapshots, diff changes, selective undo, full system rollback. All destructive operations have confirmation gates and take safety snapshots first.
+
+**Commands:**
+| Verb | What |
+|------|------|
+| `nix-rollback` | List last 15 snapshots (pretty-printed) |
+| `nix-rollback list [N]` | Last N snapshots |
+| `nix-rollback status <N> [M]` | Files changed between N and M (M=0 for current) |
+| `nix-rollback diff <N> [M] [path]` | Actual diff, colorized. Optionally filter to a path |
+| `nix-rollback undo <N> [M] [files]` | Selective undo — takes safety snapshot first, double-confirms |
+| `nix-rollback to <N>` | Full system rollback — requires reboot, double-confirms |
+
+**Shell:** `nix :rollback [verb] [args]`
+
+**Range syntax:** `N M` or `N..M`. M defaults to 0 (current system).
+
+**Safety protocol:**
+- `undo` takes a safety snapshot before reverting anything
+- `to` (full rollback) requires two confirmations
+- Current system state is always preserved as a read-only snapshot
+- No destructive operation runs without explicit user consent
+
+**Typical workflow after a bad `zypper dup`:**
+1. `nix :triage` — see what's broken
+2. `nix :rollback` — find the pre-zypper snapshot
+3. `nix :rollback status 44` — see what the update changed
+4. `nix :rollback diff 44 /etc/some.conf` — inspect a specific file
+5. `nix :rollback undo 44` — selective revert, or `nix :rollback to 44` — full rollback + reboot
+
+---
+
 ## Shell Dispatcher — `nix`
 
 Defined in `~/.nix/nix-shell.sh`, sourced from `.bashrc`.
@@ -106,6 +197,9 @@ Defined in `~/.nix/nix-shell.sh`, sourced from `.bashrc`.
 | `nix :curate` | Cluster data JSON |
 | `nix :git [cmd]` | Cloud-synced persistence |
 | `nix :notif [N]` | Recent notifications |
+| `nix :triage [flags]` | Surface errors (journal/kernel/coredumps) |
+| `nix :rollback [verb] [args]` | Snapper co-pilot (browse/diff/undo/rollback) |
+| `nix :health [flags]` | System health briefing (7 parallel checks) |
 | `nix :help` | Command list |
 
 `:note` categories: `learn`, `pref`, `project`, `feedback`, `system` (default: notes.md)

@@ -180,6 +180,9 @@ ${__nix_c_pink}❯${__nix_c_reset} nix — shellside handles
   ${__nix_c_muted}nix :curate${__nix_c_reset}            cluster data for synthesis
   ${__nix_c_muted}nix :git${__nix_c_reset}               cloud-synced state (see :git help)
   ${__nix_c_muted}nix :notif [N]${__nix_c_reset}         recent notifications (see :notif help)
+  ${__nix_c_muted}nix :triage${__nix_c_reset}            surface errors (see :triage help)
+  ${__nix_c_muted}nix :rollback${__nix_c_reset}          snapper co-pilot (see :rollback help)
+  ${__nix_c_muted}nix :health${__nix_c_reset}            system health briefing (see :health help)
   ${__nix_c_muted}nix :help${__nix_c_reset}              this
 EOF
 }
@@ -257,6 +260,9 @@ nix() {
             curate) "$HOME/.nix/bin/nix-memory" curate "$@" ;;
             clusters) "$HOME/.nix/bin/nix-memory" clusters "$@" ;;
             memory) "$HOME/.nix/bin/nix-memory" "$@" ;;
+            triage)   "$HOME/.nix/bin/nix-triage" "$@" ;;
+            rollback) "$HOME/.nix/bin/nix-rollback" "$@" ;;
+            health)   "$HOME/.nix/bin/nix-health" "$@" ;;
             help)   __nix_help        ;;
             *)
                 printf 'nix: unknown subcommand :%s (try :help)\n' "$sub" >&2

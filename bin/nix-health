@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+# -----------------------------------------------------------------
+#   nix-health -- system health briefing
+#
+#   The "open your eyes" command. One scan, full picture.
+#   Designed to run at session start or after anything risky.
+#
+#   Usage:
+#     nix-health                full briefing
+#     nix-health --quick        skip slow checks (zypper)
+#     nix-health --json         structured output
+#     nix-health --section X    only run one section
+#     nix-health help           this
+# -----------------------------------------------------------------
+
+import json
+import os
+import re
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+# -- palette (Catppuccin Mocha) ------------------------------------
+
+C_PINK   = "\033[38;2;245;194;231m"
+C_MAUVE  = "\033[38;2;203;166;247m"
+C_TEXT   = "\033[38;2;205;214;244m"
+C_MUTED  = "\033[38;2;127;132;156m"
+C_GREEN  = "\033[38;2;166;227;161m"
+C_YELLOW = "\033[38;2;249;226;175m"
+C_RED    = "\033[38;2;243;139;168m"
+C_PEACH  = "\033[38;2;250;179;135m"
+C_BOLD   = "\033[1m"
+C_RESET  = "\033[0m"
+
+# -- helpers -------------------------------------------------------
+
+def run(cmd, timeout=15):
+    """Run command, return stdout. Swallow errors."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def section_header(name):
+    print(f"\n  {C_MAUVE}{name}{C_RESET}")
+
+
+def label_val(label, value, color=None):
+    """Print a label: value pair."""
+    vc = color or C_TEXT
+    print(f"    {C_MUTED}{label:<14}{C_RESET} {vc}{value}{C_RESET}")
+
+
+def threshold(val, warn, crit, unit="", invert=False):
+    """Color a numeric value based on thresholds."""
+    if invert:  # lower is worse (e.g., free space)
+        if val <= crit:
+            return f"{C_RED}{val}{unit}{C_RESET}"
+        elif val <= warn:
+            return f"{C_YELLOW}{val}{unit}{C_RESET}"
+        return f"{C_GREEN}{val}{unit}{C_RESET}"
+    else:  # higher is worse (e.g., temp, load)
+        if val >= crit:
+            return f"{C_RED}{val}{unit}{C_RESET}"
+        elif val >= warn:
+            return f"{C_YELLOW}{val}{unit}{C_RESET}"
+        return f"{C_GREEN}{val}{unit}{C_RESET}"
+
+
+# -- sections ------------------------------------------------------
+
+def check_system():
+    """Hostname, kernel, uptime, load."""
+    results = {}
+
+    host = run(["uname", "-n"])
+    kernel = run(["uname", "-r"])
+    results["host"] = host
+    results["kernel"] = kernel
+
+    # Uptime from /proc
+    try:
+        with open("/proc/uptime") as f:
+            secs = int(float(f.read().split()[0]))
+        d, rem = divmod(secs, 86400)
+        h, rem = divmod(rem, 3600)
+        m = rem // 60
+        parts = []
+        if d:
+            parts.append(f"{d}d")
+        if h:
+            parts.append(f"{h}h")
+        parts.append(f"{m}m")
+        results["uptime"] = " ".join(parts)
+        results["uptime_secs"] = secs
+    except Exception:
+        results["uptime"] = "?"
+        results["uptime_secs"] = 0
+
+    # Load
+    try:
+        with open("/proc/loadavg") as f:
+            parts = f.read().split()
+        results["load_1"] = float(parts[0])
+        results["load_5"] = float(parts[1])
+        results["load_15"] = float(parts[2])
+    except Exception:
+        results["load_1"] = results["load_5"] = results["load_15"] = 0.0
+
+    results["cores"] = os.cpu_count() or 1
+
+    return results
+
+
+def print_system(data):
+    section_header("system")
+    label_val("host", data["host"])
+    label_val("kernel", data["kernel"])
+    label_val("uptime", data["uptime"])
+
+    cores = data["cores"]
+    load1 = data["load_1"]
+    load_str = (
+        f"{threshold(load1, cores * 0.7, cores * 0.9)} "
+        f"{C_MUTED}{data['load_5']:.2f} {data['load_15']:.2f} "
+        f"({cores} cores){C_RESET}"
+    )
+    label_val("load", load_str)
+
+
+def check_resources():
+    """Memory, swap, disk, thermals, battery."""
+    results = {}
+
+    # Memory
+    try:
+        raw = run(["free", "-b"]).splitlines()
+        mem_parts = raw[1].split()
+        results["mem_total"] = int(mem_parts[1])
+        results["mem_used"] = int(mem_parts[2])
+        results["mem_available"] = int(mem_parts[6])
+        if len(raw) > 2 and raw[2].startswith("Swap"):
+            swap_parts = raw[2].split()
+            results["swap_total"] = int(swap_parts[1])
+            results["swap_used"] = int(swap_parts[2])
+        else:
+            results["swap_total"] = results["swap_used"] = 0
+    except Exception:
+        results["mem_total"] = results["mem_used"] = results["mem_available"] = 0
+        results["swap_total"] = results["swap_used"] = 0
+
+    # Disk — root filesystem
+    try:
+        lines = run(["df", "-B1", "/"]).splitlines()
+        parts = lines[1].split()
+        results["disk_total"] = int(parts[1])
+        results["disk_used"] = int(parts[2])
+        results["disk_avail"] = int(parts[3])
+        results["disk_pct"] = int(parts[4].rstrip("%"))
+    except Exception:
+        results["disk_total"] = results["disk_used"] = results["disk_avail"] = 0
+        results["disk_pct"] = 0
+
+    # Thermals — find the hottest zone
+    results["thermals"] = []
+    try:
+        import glob
+        zones = sorted(glob.glob("/sys/class/thermal/thermal_zone*"))
+        for z in zones:
+            try:
+                with open(os.path.join(z, "type")) as f:
+                    ztype = f.read().strip()
+                with open(os.path.join(z, "temp")) as f:
+                    temp = int(f.read().strip())
+                # Some zones report in millidegrees, some in degrees
+                if temp > 1000:
+                    temp = temp // 1000
+                results["thermals"].append({"zone": ztype, "temp": temp})
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Battery
+    bat_path = "/sys/class/power_supply/BAT0"
+    if os.path.isdir(bat_path):
+        try:
+            with open(os.path.join(bat_path, "status")) as f:
+                results["bat_status"] = f.read().strip()
+            with open(os.path.join(bat_path, "capacity")) as f:
+                results["bat_pct"] = int(f.read().strip())
+        except Exception:
+            results["bat_status"] = "?"
+            results["bat_pct"] = -1
+    else:
+        results["bat_status"] = None
+
+    return results
+
+
+def fmt_bytes(b):
+    """Human-readable bytes."""
+    for unit in ("B", "K", "M", "G", "T"):
+        if abs(b) < 1024:
+            return f"{b:.1f}{unit}" if unit != "B" else f"{b}{unit}"
+        b /= 1024
+    return f"{b:.1f}P"
+
+
+def print_resources(data):
+    section_header("resources")
+
+    # Memory
+    mem_total = data["mem_total"]
+    mem_used = data["mem_used"]
+    mem_pct = round(mem_used / mem_total * 100) if mem_total else 0
+    label_val("memory",
+              f"{fmt_bytes(mem_used)} / {fmt_bytes(mem_total)} "
+              f"({threshold(mem_pct, 70, 90, '%')})"
+              f"  {C_MUTED}{fmt_bytes(data['mem_available'])} available{C_RESET}")
+
+    # Swap
+    swap_total = data["swap_total"]
+    swap_used = data["swap_used"]
+    if swap_total > 0:
+        swap_pct = round(swap_used / swap_total * 100)
+        label_val("swap",
+                  f"{fmt_bytes(swap_used)} / {fmt_bytes(swap_total)} "
+                  f"({threshold(swap_pct, 50, 80, '%')})")
+
+    # Disk
+    label_val("disk /",
+              f"{fmt_bytes(data['disk_used'])} / {fmt_bytes(data['disk_total'])} "
+              f"({threshold(data['disk_pct'], 80, 95, '%')})"
+              f"  {C_MUTED}{fmt_bytes(data['disk_avail'])} free{C_RESET}")
+
+    # Thermals — show hottest, warn if high
+    thermals = data.get("thermals", [])
+    if thermals:
+        # Filter out bogus 0-degree readings
+        real = [t for t in thermals if t["temp"] > 0]
+        if real:
+            hottest = max(real, key=lambda t: t["temp"])
+            t = hottest["temp"]
+            label_val("thermals",
+                      f"{threshold(t, 70, 85, '°C')} "
+                      f"{C_MUTED}({hottest['zone']}){C_RESET}")
+
+    # Battery
+    if data.get("bat_status") is not None:
+        pct = data["bat_pct"]
+        status = data["bat_status"]
+        if status in ("Charging", "Full"):
+            color = C_GREEN
+        elif pct <= 15:
+            color = C_RED
+        elif pct <= 30:
+            color = C_YELLOW
+        else:
+            color = C_TEXT
+        label_val("battery", f"{color}{pct}%{C_RESET} {C_MUTED}({status}){C_RESET}")
+
+
+def check_services():
+    """Failed systemd units."""
+    raw = run(["systemctl", "--failed", "--no-pager", "--no-legend"])
+    failed = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if parts:
+            failed.append(parts[0])
+    return {"failed": failed}
+
+
+def print_services(data):
+    section_header("services")
+    failed = data["failed"]
+    if not failed:
+        label_val("systemd", f"{C_GREEN}all clear{C_RESET}")
+    else:
+        label_val("failed", f"{C_RED}{len(failed)} unit(s){C_RESET}")
+        for u in failed[:10]:
+            print(f"      {C_RED}>{C_RESET} {u}")
+        if len(failed) > 10:
+            print(f"      {C_MUTED}... and {len(failed) - 10} more{C_RESET}")
+
+
+def check_network():
+    """Active interfaces, connectivity."""
+    results = {"interfaces": []}
+
+    raw = run(["ip", "-br", "addr"])
+    for line in raw.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        name = parts[0]
+        state = parts[1]
+        addrs = parts[2:] if len(parts) > 2 else []
+        # Skip loopback
+        if name == "lo":
+            continue
+        results["interfaces"].append({
+            "name": name,
+            "state": state,
+            "addrs": addrs,
+        })
+
+    # DNS
+    try:
+        with open("/etc/resolv.conf") as f:
+            lines = f.readlines()
+        ns = [l.split()[1] for l in lines if l.strip().startswith("nameserver")]
+        results["dns"] = ns
+    except Exception:
+        results["dns"] = []
+
+    return results
+
+
+def print_network(data):
+    section_header("network")
+    for iface in data["interfaces"]:
+        state = iface["state"]
+        if state == "UP":
+            sc = C_GREEN
+        elif state == "DOWN":
+            sc = C_MUTED
+        else:
+            sc = C_YELLOW
+        addrs = " ".join(a.split("/")[0] for a in iface["addrs"] if "." in a)  # IPv4 only for brevity
+        label_val(iface["name"], f"{sc}{state}{C_RESET}  {addrs}")
+
+    if data["dns"]:
+        label_val("dns", " ".join(data["dns"]))
+
+
+def check_updates(skip=False):
+    """Pending zypper updates."""
+    if skip:
+        return {"count": -1, "packages": [], "skipped": True}
+
+    # Use zypper lu (list-updates) with XML for structured output
+    raw = run(["zypper", "--xmlout", "list-updates"], timeout=60)
+    packages = []
+    # Parse XML minimally — look for update elements
+    for match in re.finditer(r'<update\s+[^>]*name="([^"]*)"[^>]*edition="([^"]*)"[^>]*edition-old="([^"]*)"', raw):
+        packages.append({
+            "name": match.group(1),
+            "new": match.group(2),
+            "old": match.group(3),
+        })
+
+    return {"count": len(packages), "packages": packages, "skipped": False}
+
+
+def print_updates(data):
+    section_header("updates")
+    if data.get("skipped"):
+        label_val("pending", f"{C_MUTED}skipped (--quick){C_RESET}")
+        return
+
+    count = data["count"]
+    if count == 0:
+        label_val("pending", f"{C_GREEN}up to date{C_RESET}")
+    else:
+        color = C_YELLOW if count < 50 else C_RED
+        label_val("pending", f"{color}{count} package(s){C_RESET}")
+        # Show notable ones (KDE, kernel, glibc, systemd)
+        notable_re = re.compile(r"^(kernel|glibc|systemd|plasma|kwin|firefox|mesa)", re.I)
+        notable = [p for p in data["packages"] if notable_re.match(p["name"])]
+        if notable:
+            for p in notable[:8]:
+                print(f"      {C_PEACH}>{C_RESET} {p['name']}  {C_MUTED}{p['old']} -> {p['new']}{C_RESET}")
+            remaining = len(notable) - 8
+            if remaining > 0:
+                print(f"      {C_MUTED}... and {remaining} more notable{C_RESET}")
+
+
+def check_errors():
+    """Recent errors from journal (triage summary)."""
+    # Pull err+ since boot from journalctl
+    raw = run(["journalctl", "--no-pager", "-q", "-o", "json",
+               "--priority=0..3", "-b"], timeout=15)
+
+    counts = {"emerg": 0, "alert": 0, "crit": 0, "err": 0}
+    units = {}
+    total = 0
+
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            p = int(obj.get("PRIORITY", 6))
+            total += 1
+            if p <= 0:
+                counts["emerg"] += 1
+            elif p == 1:
+                counts["alert"] += 1
+            elif p == 2:
+                counts["crit"] += 1
+            elif p == 3:
+                counts["err"] += 1
+            unit = obj.get("SYSLOG_IDENTIFIER") or obj.get("_COMM") or "?"
+            units[unit] = units.get(unit, 0) + 1
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    # Top offenders
+    top = sorted(units.items(), key=lambda x: -x[1])[:5]
+
+    return {"total": total, "counts": counts, "top_units": top}
+
+
+def print_errors(data):
+    section_header("errors (since boot)")
+    total = data["total"]
+    if total == 0:
+        label_val("journal", f"{C_GREEN}all clear{C_RESET}")
+        return
+
+    counts = data["counts"]
+    parts = []
+    for level, color in [("emerg", C_RED), ("alert", C_RED), ("crit", C_RED), ("err", C_YELLOW)]:
+        if counts[level]:
+            parts.append(f"{color}{counts[level]} {level}{C_RESET}")
+
+    label_val("journal", f"{', '.join(parts)}  {C_MUTED}({total} total){C_RESET}")
+
+    if data["top_units"]:
+        top_str = ", ".join(f"{u} ({n})" for u, n in data["top_units"])
+        label_val("top", f"{C_MUTED}{top_str}{C_RESET}")
+    print(f"    {C_MUTED}{'':14} run :triage for details{C_RESET}")
+
+
+def check_snapshots():
+    """Snapshot count and range."""
+    raw = run(["sudo", "snapper", "-c", "root", "--jsonout", "list"], timeout=15)
+    try:
+        data = json.loads(raw)
+        snaps = data.get("root", data) if isinstance(data, dict) else data
+        # Filter out snapshot 0 (current)
+        snaps = [s for s in snaps if s.get("number", 0) != 0]
+
+        if not snaps:
+            return {"count": 0, "oldest": "?", "newest": "?"}
+
+        return {
+            "count": len(snaps),
+            "oldest": snaps[0].get("date", "?")[:16] if snaps else "?",
+            "newest": snaps[-1].get("date", "?")[:16] if snaps else "?",
+        }
+    except (json.JSONDecodeError, TypeError):
+        return {"count": 0, "oldest": "?", "newest": "?"}
+
+
+def print_snapshots(data):
+    section_header("snapshots")
+    count = data["count"]
+    if count == 0:
+        label_val("snapper", f"{C_YELLOW}no snapshots{C_RESET}")
+    else:
+        label_val("count", str(count))
+        label_val("range", f"{C_MUTED}{data['oldest']} .. {data['newest']}{C_RESET}")
+
+
+# -- orchestrator --------------------------------------------------
+
+ALL_SECTIONS = ["system", "resources", "services", "network", "updates", "errors", "snapshots"]
+
+CHECKERS = {
+    "system":    (check_system,    print_system),
+    "resources": (check_resources, print_resources),
+    "services":  (check_services,  print_services),
+    "network":   (check_network,   print_network),
+    "updates":   (check_updates,   print_updates),
+    "errors":    (check_errors,    print_errors),
+    "snapshots": (check_snapshots, print_snapshots),
+}
+
+
+def run_health(sections=None, quick=False, json_out=False):
+    sections = sections or ALL_SECTIONS
+
+    # Run checks in parallel for speed
+    results = {}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {}
+        for name in sections:
+            checker, _ = CHECKERS[name]
+            if name == "updates":
+                futures[pool.submit(checker, skip=quick)] = name
+            else:
+                futures[pool.submit(checker)] = name
+
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                results[name] = future.result()
+            except Exception as e:
+                results[name] = {"error": str(e)}
+
+    if json_out:
+        print(json.dumps(results, indent=2, default=str))
+        return
+
+    print(f"{C_PINK}>{C_RESET} health")
+
+    for name in sections:
+        if name in results:
+            data = results[name]
+            if isinstance(data, dict) and "error" in data:
+                section_header(name)
+                label_val("error", f"{C_RED}{data['error']}{C_RESET}")
+            else:
+                _, printer = CHECKERS[name]
+                printer(data)
+
+    print()
+
+
+# -- help ----------------------------------------------------------
+
+def print_help():
+    print(f"{C_PINK}>{C_RESET} nix :health -- system health briefing\n")
+    print(f"  {C_MUTED}:health{C_RESET}                full briefing (all sections)")
+    print(f"  {C_MUTED}:health --quick{C_RESET}         skip slow checks (zypper updates)")
+    print(f"  {C_MUTED}:health --json{C_RESET}          structured output")
+    print(f"  {C_MUTED}:health --section X{C_RESET}     single section")
+    print(f"  {C_MUTED}:health help{C_RESET}            this")
+    print()
+    print(f"  {C_MUTED}sections:{C_RESET} {', '.join(ALL_SECTIONS)}")
+
+
+# -- main ----------------------------------------------------------
+
+def main():
+    args = sys.argv[1:]
+
+    if args and args[0] in ("help", "-h", "--help"):
+        print_help()
+        return
+
+    quick = False
+    json_out = False
+    section_filter = None
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--quick":
+            quick = True
+            i += 1
+        elif a == "--json":
+            json_out = True
+            i += 1
+        elif a == "--section" and i + 1 < len(args):
+            section_filter = [args[i + 1]]
+            i += 2
+        else:
+            i += 1
+
+    run_health(sections=section_filter, quick=quick, json_out=json_out)
+
+
+if __name__ == "__main__":
+    main()

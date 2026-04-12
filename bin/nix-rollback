@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+# -----------------------------------------------------------------
+#   nix-rollback -- snapper co-pilot
+#
+#   Browse snapshots, diff changes, selective undo, full rollback.
+#   Wraps snapper with judgment and safety gates.
+#
+#   Usage:
+#     nix-rollback                       list recent snapshots
+#     nix-rollback list [N]              last N snapshots (default 15)
+#     nix-rollback status <N> [M]        files changed between N..M (M=0 for current)
+#     nix-rollback diff <N> [M] [path]   actual diff between N..M
+#     nix-rollback undo <N> [M] [files]  selective undo (with confirmation)
+#     nix-rollback to <N>                full rollback to snapshot N (requires reboot)
+#     nix-rollback help                  this
+# -----------------------------------------------------------------
+
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime
+
+# -- palette (Catppuccin Mocha) ------------------------------------
+
+C_PINK   = "\033[38;2;245;194;231m"
+C_MAUVE  = "\033[38;2;203;166;247m"
+C_TEXT   = "\033[38;2;205;214;244m"
+C_MUTED  = "\033[38;2;127;132;156m"
+C_GREEN  = "\033[38;2;166;227;161m"
+C_YELLOW = "\033[38;2;249;226;175m"
+C_RED    = "\033[38;2;243;139;168m"
+C_PEACH  = "\033[38;2;250;179;135m"
+C_BOLD   = "\033[1m"
+C_RESET  = "\033[0m"
+
+
+# -- helpers -------------------------------------------------------
+
+def run(cmd, check=False):
+    """Run a command, return stdout. Uses sudo for snapper."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if check and r.returncode != 0:
+            err = r.stderr.strip() or r.stdout.strip()
+            print(f"  {C_RED}error:{C_RESET} {err}")
+            sys.exit(1)
+        return r.stdout
+    except subprocess.TimeoutExpired:
+        print(f"  {C_RED}error:{C_RESET} command timed out")
+        sys.exit(1)
+
+
+def snapper(*args, check=False):
+    """Run snapper with sudo."""
+    return run(["sudo", "snapper", "-c", "root"] + list(args), check=check)
+
+
+def snapper_json(*args, check=False):
+    """Run snapper with sudo and JSON output (global flag)."""
+    return run(["sudo", "snapper", "-c", "root", "--jsonout"] + list(args), check=check)
+
+
+def confirm(prompt):
+    """Ask for confirmation. Returns True if user says yes."""
+    try:
+        answer = input(f"  {C_YELLOW}{prompt}{C_RESET} [y/N] ").strip().lower()
+        return answer in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+
+def parse_snap_number(s):
+    """Parse a snapshot number, return int or None."""
+    try:
+        return int(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def resolve_range(args):
+    """Parse N [M] from args. Returns (n, m) where m defaults to 0 (current system)."""
+    if not args:
+        return None, None
+
+    # Support N..M syntax
+    if ".." in args[0]:
+        parts = args[0].split("..")
+        n = parse_snap_number(parts[0])
+        m = parse_snap_number(parts[1]) if len(parts) > 1 else 0
+        return n, m
+
+    n = parse_snap_number(args[0])
+    m = parse_snap_number(args[1]) if len(args) > 1 and args[1].isdigit() else 0
+    return n, m
+
+
+# -- list ----------------------------------------------------------
+
+def cmd_list(args):
+    """List recent snapshots, pretty-printed."""
+    limit = 15
+    if args and args[0].isdigit():
+        limit = int(args[0])
+
+    raw = snapper_json("list", check=True)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        print(f"  {C_RED}error:{C_RESET} couldn't parse snapper output")
+        return
+
+    # snapper JSON: {"root": [...]}
+    snaps = data.get("root", data) if isinstance(data, dict) else data
+    snaps = snaps[-limit:]
+
+    print(f"{C_PINK}>{C_RESET} snapshots -- last {len(snaps)}")
+    print()
+
+    for s in snaps:
+        num = s.get("number", "?")
+        stype = s.get("type", "?")
+        date_raw = s.get("date", "")
+        desc = s.get("description", "")
+        cleanup = s.get("cleanup", "")
+
+        # Color by type
+        if stype == "pre":
+            type_color = C_YELLOW
+            type_label = "pre "
+        elif stype == "post":
+            type_color = C_GREEN
+            type_label = "post"
+        elif stype == "single":
+            type_label = "snap"
+            if "timeline" in (desc or "") or "timeline" in (cleanup or ""):
+                type_color = C_MUTED
+                type_label = "auto"
+            else:
+                type_color = C_MAUVE
+        else:
+            type_color = C_TEXT
+            type_label = stype[:4]
+
+        # Parse and format date
+        try:
+            # snapper JSON dates vary — try common formats
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%a %d %b %Y %I:%M:%S %p %Z"):
+                try:
+                    dt = datetime.strptime(date_raw.strip(), fmt)
+                    date_str = dt.strftime("%m-%d %H:%M")
+                    break
+                except ValueError:
+                    continue
+            else:
+                date_str = date_raw[:16] if date_raw else "?"
+        except Exception:
+            date_str = date_raw[:16] if date_raw else "?"
+
+        # Truncate description
+        if desc and len(desc) > 60:
+            desc = desc[:57] + "..."
+
+        print(
+            f"  {C_TEXT}{num:>4}{C_RESET}  "
+            f"{type_color}{type_label}{C_RESET}  "
+            f"{C_MUTED}{date_str}{C_RESET}  "
+            f"{desc}"
+        )
+
+
+# -- status --------------------------------------------------------
+
+def cmd_status(args):
+    """Show files changed between two snapshots."""
+    n, m = resolve_range(args)
+    if n is None:
+        print(f"  {C_RED}usage:{C_RESET} :rollback status <N> [M]")
+        print(f"  {C_MUTED}M defaults to 0 (current system){C_RESET}")
+        return
+
+    print(f"{C_PINK}>{C_RESET} changes between snapshot {n} and {m or 'current'}")
+    print()
+
+    raw = snapper("status", f"{n}..{m}", check=True)
+    lines = raw.strip().splitlines()
+
+    if not lines:
+        print(f"  {C_GREEN}no changes.{C_RESET}")
+        return
+
+    # Categorize changes
+    created, modified, deleted = [], [], []
+    for line in lines:
+        if not line or len(line) < 8:
+            continue
+        flags = line[:7]
+        path = line[8:] if len(line) > 8 else line[7:]
+
+        if flags.startswith("+"):
+            created.append(path)
+        elif flags.startswith("-"):
+            deleted.append(path)
+        else:
+            modified.append(path)
+
+    total = len(created) + len(modified) + len(deleted)
+
+    # Summary
+    parts = []
+    if created:
+        parts.append(f"{C_GREEN}{len(created)} created{C_RESET}")
+    if modified:
+        parts.append(f"{C_YELLOW}{len(modified)} modified{C_RESET}")
+    if deleted:
+        parts.append(f"{C_RED}{len(deleted)} deleted{C_RESET}")
+    print(f"  {C_MUTED}{total} files:{C_RESET} {', '.join(parts)}")
+    print()
+
+    # Show files (capped)
+    cap = 40
+    shown = 0
+
+    for path in created[:cap]:
+        print(f"  {C_GREEN}+{C_RESET} {path}")
+        shown += 1
+    for path in modified[:cap - shown] if shown < cap else []:
+        print(f"  {C_YELLOW}~{C_RESET} {path}")
+        shown += 1
+    for path in deleted[:cap - shown] if shown < cap else []:
+        print(f"  {C_RED}-{C_RESET} {path}")
+        shown += 1
+
+    remaining = total - shown
+    if remaining > 0:
+        print(f"  {C_MUTED}... and {remaining} more (use --full or pipe to less){C_RESET}")
+
+
+# -- diff ----------------------------------------------------------
+
+def cmd_diff(args):
+    """Show actual diff between snapshots, optionally for a specific path."""
+    n, m = resolve_range(args)
+    if n is None:
+        print(f"  {C_RED}usage:{C_RESET} :rollback diff <N> [M] [path]")
+        return
+
+    # Find path argument (not a number, comes after the range)
+    path_filter = None
+    for a in args:
+        if not a.isdigit() and ".." not in a:
+            path_filter = a
+            break
+
+    print(f"{C_PINK}>{C_RESET} diff between snapshot {n} and {m or 'current'}")
+    if path_filter:
+        print(f"  {C_MUTED}filtered to: {path_filter}{C_RESET}")
+    print()
+
+    cmd = ["sudo", "snapper", "-c", "root", "diff", f"{n}..{m}"]
+    if path_filter:
+        cmd.append(path_filter)
+
+    # Stream diff output directly so it can be piped/paged
+    try:
+        proc = subprocess.run(cmd, timeout=30, text=True, capture_output=True)
+        output = proc.stdout.strip()
+        if not output:
+            print(f"  {C_GREEN}no differences.{C_RESET}")
+        else:
+            # Colorize diff output
+            for line in output.splitlines():
+                if line.startswith("---") or line.startswith("+++"):
+                    print(f"{C_MAUVE}{line}{C_RESET}")
+                elif line.startswith("-"):
+                    print(f"{C_RED}{line}{C_RESET}")
+                elif line.startswith("+"):
+                    print(f"{C_GREEN}{line}{C_RESET}")
+                elif line.startswith("@@"):
+                    print(f"{C_MUTED}{line}{C_RESET}")
+                else:
+                    print(line)
+    except subprocess.TimeoutExpired:
+        print(f"  {C_RED}error:{C_RESET} diff timed out (large changeset?)")
+
+
+# -- undo ----------------------------------------------------------
+
+def cmd_undo(args):
+    """Selective undo of changes between snapshots."""
+    n, m = resolve_range(args)
+    if n is None:
+        print(f"  {C_RED}usage:{C_RESET} :rollback undo <N> [M] [files...]")
+        return
+
+    # Collect file arguments
+    files = []
+    skip_next = False
+    for i, a in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        if a.isdigit() or ".." in a:
+            continue
+        files.append(a)
+
+    # Show what we're about to do
+    print(f"{C_PINK}>{C_RESET} undo changes between snapshot {n} and {m or 'current'}")
+    if files:
+        print(f"  {C_MUTED}files:{C_RESET} {', '.join(files)}")
+    else:
+        # Show status first so user knows what they're reverting
+        raw = snapper("status", f"{n}..{m}")
+        lines = raw.strip().splitlines()
+        count = len(lines)
+        print(f"  {C_YELLOW}this will revert {count} file(s) to their state at snapshot {n}{C_RESET}")
+        # Show first few
+        for line in lines[:10]:
+            print(f"  {C_MUTED}{line}{C_RESET}")
+        if count > 10:
+            print(f"  {C_MUTED}... and {count - 10} more{C_RESET}")
+
+    print()
+
+    # Take a safety snapshot first
+    if not confirm("take a safety snapshot before undoing?"):
+        print(f"  {C_MUTED}aborted.{C_RESET}")
+        return
+
+    desc = f"nix: pre-undo safety ({n}..{m})"
+    snapper("create", "--description", desc, "--cleanup-algorithm", "number")
+    print(f"  {C_GREEN}safety snapshot taken.{C_RESET}")
+
+    if not confirm(f"proceed with undo {n}..{m}?"):
+        print(f"  {C_MUTED}aborted.{C_RESET}")
+        return
+
+    cmd = ["sudo", "snapper", "-c", "root", "undochange", f"{n}..{m}"]
+    if files:
+        cmd.extend(files)
+
+    result = run(cmd, check=True)
+    if result.strip():
+        print(result)
+    print(f"  {C_GREEN}done.{C_RESET} changes reverted.")
+
+
+# -- rollback ------------------------------------------------------
+
+def cmd_rollback(args):
+    """Full system rollback. Creates a read-only snapshot of current state,
+    then sets target snapshot as the new default subvolume. Requires reboot."""
+    if not args:
+        print(f"  {C_RED}usage:{C_RESET} :rollback to <N>")
+        return
+
+    n = parse_snap_number(args[0])
+    if n is None:
+        print(f"  {C_RED}error:{C_RESET} '{args[0]}' is not a valid snapshot number")
+        return
+
+    # Verify snapshot exists by listing
+    raw = snapper_json("list")
+    try:
+        data = json.loads(raw)
+        snaps = data.get("root", data) if isinstance(data, dict) else data
+        snap_nums = {s.get("number") for s in snaps}
+    except (json.JSONDecodeError, TypeError):
+        snap_nums = set()
+
+    if n not in snap_nums:
+        print(f"  {C_RED}error:{C_RESET} snapshot {n} not found")
+        return
+
+    # Find the snapshot description
+    target_desc = ""
+    for s in snaps:
+        if s.get("number") == n:
+            target_desc = s.get("description", "")
+            break
+
+    print(f"{C_RED}{C_BOLD}> FULL SYSTEM ROLLBACK{C_RESET}")
+    print()
+    print(f"  {C_TEXT}target:{C_RESET}  snapshot {n}")
+    if target_desc:
+        print(f"  {C_TEXT}desc:{C_RESET}    {target_desc}")
+    print()
+    print(f"  {C_YELLOW}this will:{C_RESET}")
+    print(f"    - snapshot the current system state (read-only)")
+    print(f"    - set snapshot {n} as the default boot subvolume")
+    print(f"    - {C_RED}require a reboot to take effect{C_RESET}")
+    print()
+
+    if not confirm("are you absolutely sure?"):
+        print(f"  {C_MUTED}aborted.{C_RESET}")
+        return
+
+    # Double confirmation for full rollback
+    if not confirm("final confirmation — rollback to snapshot {n}?".format(n=n)):
+        print(f"  {C_MUTED}aborted.{C_RESET}")
+        return
+
+    result = run(["sudo", "snapper", "-c", "root", "rollback", str(n)], check=True)
+    if result.strip():
+        print(result)
+
+    print()
+    print(f"  {C_GREEN}rollback complete.{C_RESET}")
+    print(f"  {C_YELLOW}reboot to boot into snapshot {n}.{C_RESET}")
+    print(f"  {C_MUTED}(your current state is preserved as a read-only snapshot){C_RESET}")
+
+
+# -- help ----------------------------------------------------------
+
+def print_help():
+    print(f"{C_PINK}>{C_RESET} nix :rollback -- snapper co-pilot\n")
+    print(f"  {C_MUTED}:rollback{C_RESET}                     list recent snapshots")
+    print(f"  {C_MUTED}:rollback list [N]{C_RESET}             last N snapshots (default 15)")
+    print(f"  {C_MUTED}:rollback status <N> [M]{C_RESET}       files changed (M=0 for current)")
+    print(f"  {C_MUTED}:rollback status <N..M>{C_RESET}        alternate range syntax")
+    print(f"  {C_MUTED}:rollback diff <N> [M] [path]{C_RESET}  actual diff between snapshots")
+    print(f"  {C_MUTED}:rollback undo <N> [M] [files]{C_RESET} selective undo (takes safety snap)")
+    print(f"  {C_MUTED}:rollback to <N>{C_RESET}               full rollback (requires reboot)")
+    print(f"  {C_MUTED}:rollback help{C_RESET}                 this")
+
+
+# -- main ----------------------------------------------------------
+
+def main():
+    args = sys.argv[1:]
+
+    if not args:
+        cmd_list([])
+        return
+
+    verb = args[0]
+    rest = args[1:]
+
+    if verb in ("help", "-h", "--help"):
+        print_help()
+    elif verb == "list":
+        cmd_list(rest)
+    elif verb == "status":
+        cmd_status(rest)
+    elif verb == "diff":
+        cmd_diff(rest)
+    elif verb == "undo":
+        cmd_undo(rest)
+    elif verb == "to":
+        cmd_rollback(rest)
+    elif verb.isdigit():
+        # Bare number — treat as status against current
+        cmd_status([verb] + rest)
+    else:
+        print(f"  {C_RED}unknown command:{C_RESET} {verb}")
+        print(f"  {C_MUTED}try: :rollback help{C_RESET}")
+
+
+if __name__ == "__main__":
+    main()

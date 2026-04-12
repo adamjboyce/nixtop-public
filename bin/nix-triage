@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+# -----------------------------------------------------------------
+#   nix-triage -- surface what's broken on this machine
+#
+#   Scans journalctl (system + kernel) and coredumpctl for errors,
+#   deduplicates, color-codes by severity, and prints a prioritized
+#   summary. Designed for Tumbleweed where stuff *will* break.
+#
+#   Usage:
+#     nix-triage                    last hour, all sources
+#     nix-triage --since 30m        custom time window (s|m|h|d)
+#     nix-triage --since boot       since last boot
+#     nix-triage --unit <name>      filter journal by systemd unit
+#     nix-triage --source <s>       journal | kernel | coredump
+#     nix-triage --priority <p>     0-7 or name (emerg..debug)
+#     nix-triage --full             show full messages, no truncation
+#     nix-triage --json             structured JSON output (for me)
+#     nix-triage help               this
+# -----------------------------------------------------------------
+
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import Counter
+from datetime import datetime
+
+# -- palette (Catppuccin Mocha) ------------------------------------
+
+C_PINK   = "\033[38;2;245;194;231m"
+C_MAUVE  = "\033[38;2;203;166;247m"
+C_TEXT   = "\033[38;2;205;214;244m"
+C_MUTED  = "\033[38;2;127;132;156m"
+C_GREEN  = "\033[38;2;166;227;161m"
+C_YELLOW = "\033[38;2;249;226;175m"
+C_RED    = "\033[38;2;243;139;168m"
+C_PEACH  = "\033[38;2;250;179;135m"
+C_BOLD   = "\033[1m"
+C_RESET  = "\033[0m"
+
+# -- constants -----------------------------------------------------
+
+PRIORITY_NAMES = {
+    "emerg": 0, "alert": 1, "crit": 2, "err": 3,
+    "warning": 4, "notice": 5, "info": 6, "debug": 7,
+}
+PRIORITY_LABELS = ["EMERG", "ALERT", "CRIT", "ERR", "WARN", "NOTICE", "INFO", "DEBUG"]
+PRIORITY_COLORS = [C_RED, C_RED, C_RED, C_RED, C_YELLOW, C_MUTED, C_TEXT, C_MUTED]
+
+DUR_RE = re.compile(r"^(\d+)([smhd])$")
+
+# Default: show err and above
+DEFAULT_MAX_PRIORITY = 4  # warning
+
+
+# -- helpers -------------------------------------------------------
+
+def parse_priority(s):
+    """Parse priority string to int (0=emerg, 7=debug)."""
+    s = s.strip().lower()
+    if s in PRIORITY_NAMES:
+        return PRIORITY_NAMES[s]
+    try:
+        n = int(s)
+        if 0 <= n <= 7:
+            return n
+    except ValueError:
+        pass
+    return None
+
+
+def since_arg(s):
+    """Convert our duration syntax to journalctl --since format."""
+    if s == "boot":
+        return None  # handled via -b flag
+    m = DUR_RE.match(s)
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2)
+    secs = n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    dt = datetime.now()
+    from datetime import timedelta
+    dt = dt - timedelta(seconds=secs)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def run_cmd(cmd):
+    """Run a command, return stdout lines. Swallow errors."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        return r.stdout
+    except Exception:
+        return ""
+
+
+# -- journal scanner -----------------------------------------------
+
+def scan_journal(since_str=None, boot=False, unit=None, max_priority=DEFAULT_MAX_PRIORITY, kernel_only=False):
+    """Pull structured entries from journalctl."""
+    cmd = ["journalctl", "--no-pager", "-q", "-o", "json",
+           f"--priority=0..{max_priority}"]
+
+    if boot:
+        cmd.append("-b")
+    elif since_str:
+        cmd.extend(["--since", since_str])
+    else:
+        cmd.extend(["--since", "-1h"])
+
+    if unit:
+        cmd.extend(["-u", unit])
+
+    if kernel_only:
+        cmd.append("-k")
+
+    raw = run_cmd(cmd)
+    entries = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            is_kernel = (kernel_only
+                         or obj.get("_TRANSPORT") == "kernel"
+                         or obj.get("SYSLOG_IDENTIFIER") == "kernel")
+            entries.append({
+                "ts": int(obj.get("__REALTIME_TIMESTAMP", "0")) // 1_000_000,
+                "priority": int(obj.get("PRIORITY", 6)),
+                "unit": obj.get("SYSLOG_IDENTIFIER") or obj.get("_COMM") or obj.get("_SYSTEMD_UNIT") or "?",
+                "message": obj.get("MESSAGE", ""),
+                "source": "kernel" if is_kernel else "journal",
+            })
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return entries
+
+
+# -- coredump scanner ----------------------------------------------
+
+def scan_coredumps(since_str=None, boot=False):
+    """Pull recent coredumps from coredumpctl."""
+    cmd = ["coredumpctl", "list", "--no-pager", "-q"]
+    if boot:
+        cmd.append("-b")
+
+    raw = run_cmd(cmd)
+    entries = []
+    for line in raw.splitlines():
+        # Header lines start with TIME or contain "No coredumps"
+        if not line or line.startswith("TIME") or "No coredumps" in line:
+            continue
+        parts = line.split()
+        if len(parts) < 7:
+            continue
+        try:
+            # Format: "Sat 2026-04-11 15:02:01 CDT <PID> <UID> <GID> <SIG> <PRESENT> <EXE> [SIZE]"
+            date_str = f"{parts[1]} {parts[2]}"
+            ts = int(datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S").timestamp())
+            sig = parts[6]
+            exe = parts[8] if len(parts) > 8 else parts[7]
+            exe = os.path.basename(exe)
+
+            # If we have a since filter, skip old ones
+            if since_str and not boot:
+                cutoff = int(datetime.strptime(since_str, "%Y-%m-%d %H:%M:%S").timestamp())
+                if ts < cutoff:
+                    continue
+
+            entries.append({
+                "ts": ts,
+                "priority": 2,  # crit
+                "unit": exe,
+                "message": f"Process crashed with {sig}",
+                "source": "coredump",
+            })
+        except (ValueError, IndexError):
+            continue
+    return entries
+
+
+# -- deduplication -------------------------------------------------
+
+def dedup(entries):
+    """Group identical (unit, message) pairs, keep latest ts and count."""
+    groups = {}
+    for e in entries:
+        key = (e["source"], e["unit"], e["priority"], e["message"][:200])
+        if key not in groups:
+            groups[key] = {**e, "count": 1}
+        else:
+            groups[key]["count"] += 1
+            groups[key]["ts"] = max(groups[key]["ts"], e["ts"])
+    # Sort by priority (ascending = most severe first), then by ts descending
+    result = sorted(groups.values(), key=lambda x: (x["priority"], -x["ts"]))
+    return result
+
+
+# -- formatters ----------------------------------------------------
+
+def fmt_time(ts):
+    now = datetime.now().timestamp()
+    dt = datetime.fromtimestamp(ts)
+    if now - ts < 86400:
+        return dt.strftime("%H:%M:%S")
+    return dt.strftime("%m-%d %H:%M")
+
+
+def source_badge(source):
+    badges = {
+        "journal":  f"{C_MAUVE}journal{C_RESET}",
+        "kernel":   f"{C_PEACH}kernel{C_RESET}",
+        "coredump": f"{C_RED}crash{C_RESET}",
+    }
+    return badges.get(source, source)
+
+
+def print_entries(entries, full=False):
+    if not entries:
+        print(f"  {C_GREEN}all clear.{C_RESET} {C_MUTED}no errors in this window.{C_RESET}")
+        return
+
+    for e in entries:
+        p = e["priority"]
+        ts = fmt_time(e["ts"])
+        pcolor = PRIORITY_COLORS[min(p, 7)]
+        plabel = PRIORITY_LABELS[min(p, 7)]
+        unit = e["unit"][:25]
+        msg = e["message"]
+        count = e.get("count", 1)
+        src = source_badge(e["source"])
+
+        # Truncate message unless --full
+        if not full and len(msg) > 120:
+            msg = msg[:117] + "..."
+
+        count_str = ""
+        if count > 1:
+            count_str = f" {C_MUTED}x{count}{C_RESET}"
+
+        print(
+            f"  {C_MUTED}{ts}{C_RESET}  "
+            f"{pcolor}{plabel:<6}{C_RESET}  "
+            f"{src}  "
+            f"{C_TEXT}{unit:<25}{C_RESET}  "
+            f"{msg}{count_str}"
+        )
+
+
+def print_summary(entries):
+    """Print a one-line severity breakdown."""
+    counts = Counter()
+    total = 0
+    for e in entries:
+        p = e["priority"]
+        total += e.get("count", 1)
+        label = PRIORITY_LABELS[min(p, 7)]
+        counts[label] += e.get("count", 1)
+
+    parts = []
+    for label in ["EMERG", "ALERT", "CRIT", "ERR", "WARN"]:
+        if counts[label]:
+            idx = PRIORITY_LABELS.index(label)
+            color = PRIORITY_COLORS[idx]
+            parts.append(f"{color}{counts[label]} {label.lower()}{C_RESET}")
+
+    unique = len(entries)
+    if parts:
+        print(f"  {C_MUTED}{total} events ({unique} unique):{C_RESET} {', '.join(parts)}")
+    else:
+        print(f"  {C_MUTED}{total} events ({unique} unique){C_RESET}")
+
+
+def print_json(entries):
+    print(json.dumps(entries, indent=2))
+
+
+# -- help ----------------------------------------------------------
+
+def print_help():
+    print(f"{C_PINK}>{C_RESET} nix :triage -- surface what's broken\n")
+    print(f"  {C_MUTED}:triage{C_RESET}                  last hour, errors and above")
+    print(f"  {C_MUTED}:triage --since 30m{C_RESET}      custom window (s|m|h|d)")
+    print(f"  {C_MUTED}:triage --since boot{C_RESET}     since last boot")
+    print(f"  {C_MUTED}:triage --unit sshd{C_RESET}      filter by systemd unit")
+    print(f"  {C_MUTED}:triage --source X{C_RESET}       journal | kernel | coredump")
+    print(f"  {C_MUTED}:triage --priority warn{C_RESET}  set max priority (0-7 or name)")
+    print(f"  {C_MUTED}:triage --full{C_RESET}            no message truncation")
+    print(f"  {C_MUTED}:triage --json{C_RESET}            structured output")
+    print(f"  {C_MUTED}:triage help{C_RESET}              this")
+
+
+# -- main ----------------------------------------------------------
+
+def main():
+    args = sys.argv[1:]
+
+    if args and args[0] in ("help", "-h", "--help"):
+        print_help()
+        return
+
+    # Parse flags
+    since_raw = "1h"
+    unit = None
+    source_filter = None
+    max_priority = DEFAULT_MAX_PRIORITY
+    full = False
+    json_out = False
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--since" and i + 1 < len(args):
+            since_raw = args[i + 1]
+            i += 2
+            continue
+        if a == "--unit" and i + 1 < len(args):
+            unit = args[i + 1]
+            i += 2
+            continue
+        if a == "--source" and i + 1 < len(args):
+            source_filter = args[i + 1].lower()
+            i += 2
+            continue
+        if a == "--priority" and i + 1 < len(args):
+            p = parse_priority(args[i + 1])
+            if p is not None:
+                max_priority = p
+            i += 2
+            continue
+        if a == "--full":
+            full = True
+            i += 1
+            continue
+        if a == "--json":
+            json_out = True
+            i += 1
+            continue
+        i += 1
+
+    boot = since_raw == "boot"
+    since_str = None if boot else since_arg(since_raw)
+
+    # If custom time didn't parse and it's not "boot", default to 1h
+    if not boot and since_str is None:
+        since_str = since_arg("1h")
+
+    # Collect from sources
+    all_entries = []
+
+    if source_filter in (None, "journal"):
+        # Default journal scan includes kernel messages (tagged via _TRANSPORT)
+        all_entries.extend(scan_journal(since_str, boot, unit, max_priority, kernel_only=False))
+
+    if source_filter == "kernel":
+        # Only run kernel-only scan when explicitly requested
+        all_entries.extend(scan_journal(since_str, boot, unit, max_priority, kernel_only=True))
+
+    if source_filter in (None, "coredump") and unit is None:
+        all_entries.extend(scan_coredumps(since_str, boot))
+
+    # Dedup
+    entries = dedup(all_entries)
+
+    # Output
+    if json_out:
+        print_json(entries)
+        return
+
+    window = "since boot" if boot else f"last {since_raw}"
+    filters = []
+    if unit:
+        filters.append(f"unit={unit}")
+    if source_filter:
+        filters.append(f"source={source_filter}")
+    filter_str = f"  {C_MUTED}({', '.join(filters)}){C_RESET}" if filters else ""
+
+    print(f"{C_PINK}>{C_RESET} triage -- {window}{filter_str}")
+    print_summary(entries)
+    print()
+    print_entries(entries, full=full)
+
+
+if __name__ == "__main__":
+    main()
