@@ -1,0 +1,17 @@
+{
+    "KPackageStructure": "Plasma/LookAndFeel",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Nix"
+            }
+        ],
+        "Category": "",
+        "Description": "you're home.",
+        "Id": "nix-noir",
+        "License": "Custom",
+        "Name": "Nix Noir",
+        "Website": ""
+    },
+    "X-Plasma-APIVersion": "2"
+}

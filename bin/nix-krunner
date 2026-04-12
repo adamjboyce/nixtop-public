@@ -1,0 +1,893 @@
+#!/usr/bin/env python3
+# ─────────────────────────────────────────────────────────────
+#   nix-krunner — KRunner DBus plugin (phase 3)
+#
+#   Registers org.kde.runner.nix on the session bus and implements
+#   org.kde.krunner1.
+#
+#   Query classification in Match(), in order:
+#     1. Math expression      → compute via AST walker, inline result
+#     2. Unit conversion      → shell out to `units`, inline result
+#     3. State query          → live system state (battery, cpu, ip, …)
+#     4. Action               → execute a system toggle (lock, mute, …)
+#     5. Single-word app      → pass through silently
+#     6. Path-like query      → pass through silently
+#     7. Everything else      → "ask nix: <query>" fallback
+#
+#   Run() dispatches on match-id prefix:
+#     math::<expr>=<result>    → copy <result> to clipboard
+#     unit::<expr> = <result>  → copy <result> to clipboard
+#     state::<key>             → copy live value to clipboard
+#     action::<key>            → execute the action
+#     nix::<query>             → write pending, summon yakuake
+# ─────────────────────────────────────────────────────────────
+
+import ast
+import glob
+import operator
+import os
+import re
+import shutil
+import subprocess
+
+import dbus
+import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+BUS_NAME = "org.kde.runner.nix"
+OBJ_PATH = "/nix"
+IFACE = "org.kde.krunner1"
+
+HOME = os.path.expanduser("~")
+PENDING = os.path.join(HOME, ".nix", "ctx", "pending-query.txt")
+CAPTURE = os.path.join(HOME, ".nix", "bin", "nix-capture-context")
+MIN_QUERY_LEN = 2
+
+
+# ─── safe arithmetic evaluator ──────────────────────────────────
+
+class SafeMath(ast.NodeVisitor):
+    """AST walker that evaluates arithmetic only — no names, no calls, no attrs."""
+
+    OPS = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.FloorDiv: operator.floordiv,
+        ast.Mod: operator.mod,
+    }
+    UNARY = {
+        ast.USub: operator.neg,
+        ast.UAdd: operator.pos,
+    }
+
+    def visit(self, node):
+        if isinstance(node, ast.Expression):
+            return self.visit(node.body)
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)):
+                return node.value
+            raise ValueError("bad literal")
+        if isinstance(node, ast.BinOp):
+            if isinstance(node.op, ast.Pow):
+                base = self.visit(node.left)
+                exp = self.visit(node.right)
+                if abs(exp) > 1000:
+                    raise ValueError("exponent too large")
+                return base ** exp
+            op = self.OPS.get(type(node.op))
+            if op is None:
+                raise ValueError("bad op")
+            return op(self.visit(node.left), self.visit(node.right))
+        if isinstance(node, ast.UnaryOp):
+            op = self.UNARY.get(type(node.op))
+            if op is None:
+                raise ValueError("bad unary")
+            return op(self.visit(node.operand))
+        raise ValueError("bad node")
+
+
+_MATH_CHARS = re.compile(r"^[\d\s\+\-\*\/\(\)\.\%\^]+$")
+
+
+def try_math(q):
+    if not re.search(r"\d", q):
+        return None
+    if not re.search(r"[\+\-\*\/\%\^]", q):
+        return None
+    if not _MATH_CHARS.match(q):
+        return None
+    if len(q) > 100:
+        return None
+    try:
+        expr = q.replace("^", "**")
+        tree = ast.parse(expr, mode="eval")
+        result = SafeMath().visit(tree)
+        if isinstance(result, float):
+            if result.is_integer():
+                result = int(result)
+            else:
+                result = round(result, 10)
+        return str(result)
+    except Exception:
+        return None
+
+
+# ─── unit conversion via GNU units ──────────────────────────────
+
+_UNIT_PATTERN = re.compile(
+    r"^([\d\.\-]+)\s+(\S.*?)\s+(?:in|to)\s+(\S.*?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def try_unit(q):
+    if not shutil.which("units"):
+        return None
+    m = _UNIT_PATTERN.match(q)
+    if not m:
+        return None
+    amount, from_unit, to_unit = m.groups()
+    have = f"{amount} {from_unit}"
+    try:
+        r = subprocess.run(
+            ["units", "-t", have, to_unit],
+            capture_output=True, text=True, timeout=1,
+        )
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    out = (r.stdout or "").strip()
+    if not out:
+        return None
+    if "conformability" in out.lower() or "reciprocal" in out.lower():
+        return None
+    try:
+        v = float(out)
+        if v.is_integer():
+            formatted = str(int(v))
+        else:
+            formatted = f"{v:.6g}"
+    except ValueError:
+        return None
+    return f"{have} = {formatted} {to_unit}"
+
+
+# ─── live system state queries ──────────────────────────────────
+
+def _run(argv, timeout=1):
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return (r.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _q_battery():
+    cap = _read("/sys/class/power_supply/BAT0/capacity")
+    status = _read("/sys/class/power_supply/BAT0/status")
+    if not cap:
+        return None
+    return f"battery: {cap}% ({status.lower()})"
+
+
+def _q_cpu_load():
+    try:
+        with open("/proc/loadavg") as f:
+            parts = f.read().split()
+        return f"load: {parts[0]}, {parts[1]}, {parts[2]}"
+    except Exception:
+        return None
+
+
+def _q_ram():
+    out = _run(["free", "-h"])
+    # Parse: second line, "Mem:  total  used  free  shared  buff/cache  available"
+    for line in out.splitlines():
+        if line.startswith("Mem:"):
+            fields = line.split()
+            if len(fields) >= 7:
+                return f"ram: {fields[2]} / {fields[1]} used, {fields[6]} available"
+    return None
+
+
+def _q_disk():
+    out = _run(["df", "-h", "/"])
+    for line in out.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 5:
+            return f"disk: {fields[2]} / {fields[1]} used ({fields[4]}), {fields[3]} free"
+    return None
+
+
+def _q_uptime():
+    raw = _read("/proc/uptime")
+    if not raw:
+        return None
+    try:
+        secs = int(float(raw.split()[0]))
+    except Exception:
+        return None
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    m, _ = divmod(rem, 60)
+    parts = []
+    if d:
+        parts.append(f"{d}d")
+    if h:
+        parts.append(f"{h}h")
+    parts.append(f"{m}m")
+    return f"uptime: {' '.join(parts)}"
+
+
+def _q_kernel():
+    return f"kernel: {_run(['uname', '-r'])}"
+
+
+def _q_hostname():
+    return f"hostname: {_run(['uname', '-n'])}"
+
+
+def _q_ip():
+    # First global IPv4 from `ip -4 -o addr`
+    out = _run(["ip", "-4", "-o", "addr"])
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) >= 4 and fields[1] != "lo":
+            ip = fields[3].split("/")[0]
+            iface = fields[1]
+            return f"ip: {ip} ({iface})"
+    return None
+
+
+def _q_wifi():
+    out = _run(["nmcli", "-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"])
+    for line in out.splitlines():
+        parts = line.split(":")
+        if len(parts) >= 3 and "wireless" in parts[1]:
+            return f"wifi: {parts[0]} ({parts[2]})"
+    radio = _run(["nmcli", "radio", "wifi"])
+    return f"wifi: {radio or 'off'}"
+
+
+def _q_date():
+    return _run(["date", "+%a %Y-%m-%d %H:%M:%S %Z"])
+
+
+def _q_volume():
+    out = _run(["pactl", "get-sink-volume", "@DEFAULT_SINK@"])
+    m = re.search(r"(\d+)%", out)
+    if not m:
+        return None
+    vol = m.group(1)
+    mute_out = _run(["pactl", "get-sink-mute", "@DEFAULT_SINK@"])
+    muted = "muted" if "yes" in mute_out else "unmuted"
+    return f"volume: {vol}% ({muted})"
+
+
+def _q_brightness():
+    svc = "org.kde.Solid.PowerManagement"
+    path = "/org/kde/Solid/PowerManagement/Actions/BrightnessControl"
+    try:
+        cur = int(_run(["qdbus6", svc, path, "brightness"]) or "0")
+        mx = int(_run(["qdbus6", svc, path, "brightnessMax"]) or "0")
+    except Exception:
+        return None
+    if mx <= 0:
+        return None
+    pct = round(100 * cur / mx)
+    return f"brightness: {pct}%"
+
+
+def _q_temp():
+    # Prefer x86_pkg_temp (CPU package), then coretemp, then acpitz
+    preferred = ("x86_pkg_temp", "coretemp", "acpitz")
+    best = None
+    for zone in sorted(glob.glob("/sys/class/thermal/thermal_zone*")):
+        try:
+            with open(f"{zone}/type") as f:
+                ztype = f.read().strip()
+            with open(f"{zone}/temp") as f:
+                milli = int(f.read().strip())
+        except Exception:
+            continue
+        if ztype in preferred:
+            rank = preferred.index(ztype)
+            if best is None or rank < best[0]:
+                best = (rank, ztype, milli)
+    if best is None:
+        return None
+    _, ztype, milli = best
+    return f"temp: {milli/1000:.1f}°C ({ztype})"
+
+
+def _q_bluetooth():
+    out = _run(["bluetoothctl", "show"])
+    for line in out.splitlines():
+        if "Powered:" in line:
+            state = line.split(":", 1)[1].strip()
+            return f"bluetooth: {state.lower()}"
+    return None
+
+
+STATE_QUERIES = {
+    "battery": (_q_battery, "battery"),
+    "bat": (_q_battery, "battery"),
+    "cpu": (_q_cpu_load, "cpu"),
+    "load": (_q_cpu_load, "cpu"),
+    "ram": (_q_ram, "media-flash-memory-stick"),
+    "mem": (_q_ram, "media-flash-memory-stick"),
+    "memory": (_q_ram, "media-flash-memory-stick"),
+    "disk": (_q_disk, "drive-harddisk"),
+    "disk free": (_q_disk, "drive-harddisk"),
+    "disk usage": (_q_disk, "drive-harddisk"),
+    "uptime": (_q_uptime, "chronometer"),
+    "kernel": (_q_kernel, "system-run"),
+    "hostname": (_q_hostname, "computer"),
+    "host": (_q_hostname, "computer"),
+    "ip": (_q_ip, "network-wired"),
+    "my ip": (_q_ip, "network-wired"),
+    "ip address": (_q_ip, "network-wired"),
+    "wifi": (_q_wifi, "network-wireless"),
+    "wifi status": (_q_wifi, "network-wireless"),
+    "date": (_q_date, "chronometer"),
+    "time": (_q_date, "chronometer"),
+    "now": (_q_date, "chronometer"),
+    "volume": (_q_volume, "audio-volume-high"),
+    "vol": (_q_volume, "audio-volume-high"),
+    "brightness": (_q_brightness, "video-display"),
+    "bright": (_q_brightness, "video-display"),
+    "temp": (_q_temp, "computer"),
+    "temperature": (_q_temp, "computer"),
+    "cpu temp": (_q_temp, "computer"),
+    "bluetooth": (_q_bluetooth, "preferences-system-bluetooth"),
+    "bt": (_q_bluetooth, "preferences-system-bluetooth"),
+}
+
+
+def try_state_query(q):
+    handler_icon = STATE_QUERIES.get(q.lower())
+    if not handler_icon:
+        return None
+    handler, icon = handler_icon
+    try:
+        result = handler()
+    except Exception:
+        return None
+    if not result:
+        return None
+    return (result, icon)
+
+
+# ─── actions (system toggles) ────────────────────────────────────
+
+def _a_lock():
+    subprocess.run(["loginctl", "lock-session"], check=False, timeout=2)
+
+
+def _a_mute_toggle():
+    subprocess.run(
+        ["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"],
+        check=False, timeout=2,
+    )
+
+
+def _a_volume_up():
+    subprocess.run(
+        ["pactl", "set-sink-volume", "@DEFAULT_SINK@", "+5%"],
+        check=False, timeout=2,
+    )
+
+
+def _a_volume_down():
+    subprocess.run(
+        ["pactl", "set-sink-volume", "@DEFAULT_SINK@", "-5%"],
+        check=False, timeout=2,
+    )
+
+
+def _a_volume_max():
+    subprocess.run(
+        ["pactl", "set-sink-volume", "@DEFAULT_SINK@", "100%"],
+        check=False, timeout=2,
+    )
+
+
+def _a_volume_min():
+    subprocess.run(
+        ["pactl", "set-sink-volume", "@DEFAULT_SINK@", "0%"],
+        check=False, timeout=2,
+    )
+
+
+def _a_volume_half():
+    subprocess.run(
+        ["pactl", "set-sink-volume", "@DEFAULT_SINK@", "50%"],
+        check=False, timeout=2,
+    )
+
+
+def _a_volume_set(pct):
+    pct = max(0, min(100, int(pct)))
+    subprocess.run(
+        ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{pct}%"],
+        check=False, timeout=2,
+    )
+
+
+def _a_wifi_on():
+    subprocess.run(["nmcli", "radio", "wifi", "on"], check=False, timeout=3)
+
+
+def _a_wifi_off():
+    subprocess.run(["nmcli", "radio", "wifi", "off"], check=False, timeout=3)
+
+
+def _a_bluetooth_on():
+    subprocess.run(
+        ["bluetoothctl", "power", "on"],
+        check=False, timeout=3, stdout=subprocess.DEVNULL,
+    )
+
+
+def _a_bluetooth_off():
+    subprocess.run(
+        ["bluetoothctl", "power", "off"],
+        check=False, timeout=3, stdout=subprocess.DEVNULL,
+    )
+
+
+def _brightness_step(delta_frac):
+    """delta_frac is a fraction of max (e.g. 0.1 for 10% step)."""
+    svc = "org.kde.Solid.PowerManagement"
+    path = "/org/kde/Solid/PowerManagement/Actions/BrightnessControl"
+    try:
+        cur = int(_run(["qdbus6", svc, path, "brightness"]) or "0")
+        mx = int(_run(["qdbus6", svc, path, "brightnessMax"]) or "0")
+    except Exception:
+        return
+    if mx <= 0:
+        return
+    step = max(1, int(round(mx * abs(delta_frac))))
+    new = cur + (step if delta_frac > 0 else -step)
+    new = max(0, min(mx, new))
+    subprocess.run(
+        ["qdbus6", svc, path, "setBrightness", str(new)],
+        check=False, timeout=2,
+    )
+
+
+def _a_brightness_up():
+    _brightness_step(0.1)
+
+
+def _a_brightness_down():
+    _brightness_step(-0.1)
+
+
+def _a_suspend():
+    subprocess.run(["systemctl", "suspend"], check=False, timeout=2)
+
+
+def _a_theme_dark():
+    subprocess.run(
+        ["plasma-apply-colorscheme", "CatppuccinMochaMauve"],
+        check=False, timeout=5,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def _a_theme_light():
+    subprocess.run(
+        ["plasma-apply-colorscheme", "BreezeLight"],
+        check=False, timeout=5,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+# Module-level state for DND inhibition cookie (held across Run() calls).
+_dnd_cookie = None
+
+
+def _a_dnd_toggle():
+    global _dnd_cookie
+    try:
+        bus = dbus.SessionBus()
+        proxy = bus.get_object(
+            "org.freedesktop.Notifications", "/org/freedesktop/Notifications"
+        )
+        iface = dbus.Interface(proxy, "org.freedesktop.Notifications")
+        if _dnd_cookie is None:
+            cookie = iface.Inhibit("nix", "silent mode", {})
+            _dnd_cookie = int(cookie)
+        else:
+            iface.UninhibitCb = None  # no-op
+            try:
+                iface.UnInhibit(_dnd_cookie)
+            except Exception:
+                pass
+            _dnd_cookie = None
+    except Exception:
+        pass
+
+
+def _a_night_toggle():
+    # Read current state from kwinrc, flip, write back, tell kwin to reconfigure.
+    cur = _run(
+        ["kreadconfig6", "--file", "kwinrc", "--group", "NightColor", "--key", "Active"]
+    )
+    new = "false" if cur.strip().lower() == "true" else "true"
+    subprocess.run(
+        ["kwriteconfig6", "--file", "kwinrc", "--group", "NightColor",
+         "--key", "Active", new],
+        check=False, timeout=2,
+    )
+    subprocess.run(
+        ["qdbus6", "org.kde.KWin", "/KWin", "reconfigure"],
+        check=False, timeout=2,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def _a_screenshot():
+    # Full-screen, background, copy to clipboard. spectacle's default save
+    # location is ~/Pictures/Screenshots; --copy-image also saves there
+    # unless --no-save is set.
+    subprocess.Popen(
+        ["spectacle", "--fullscreen", "--background", "--copy-image"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def _a_snapshot():
+    # Manual snapper snapshot of the root subvolume. Requires passwordless
+    # sudo (Adam has jolly ALL=(ALL) NOPASSWD:ALL wired up).
+    subprocess.run(
+        ["sudo", "-n", "snapper", "-c", "root", "create",
+         "--description", "nix: krunner manual",
+         "--cleanup-algorithm", "number"],
+        check=False, timeout=10,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def _a_airplane_on():
+    subprocess.run(["nmcli", "radio", "wifi", "off"], check=False, timeout=3)
+    subprocess.run(
+        ["bluetoothctl", "power", "off"],
+        check=False, timeout=3, stdout=subprocess.DEVNULL,
+    )
+
+
+def _a_airplane_off():
+    subprocess.run(["nmcli", "radio", "wifi", "on"], check=False, timeout=3)
+    subprocess.run(
+        ["bluetoothctl", "power", "on"],
+        check=False, timeout=3, stdout=subprocess.DEVNULL,
+    )
+
+
+ACTIONS = {
+    "lock": (_a_lock, "lock screen", "system-lock-screen"),
+    "lock screen": (_a_lock, "lock screen", "system-lock-screen"),
+    "mute": (_a_mute_toggle, "toggle mute", "audio-volume-muted"),
+    "unmute": (_a_mute_toggle, "toggle mute", "audio-volume-high"),
+    "toggle mute": (_a_mute_toggle, "toggle mute", "audio-volume-muted"),
+    "volume up": (_a_volume_up, "volume up (+5%)", "audio-volume-high"),
+    "vol up": (_a_volume_up, "volume up (+5%)", "audio-volume-high"),
+    "volume down": (_a_volume_down, "volume down (-5%)", "audio-volume-low"),
+    "vol down": (_a_volume_down, "volume down (-5%)", "audio-volume-low"),
+    "max volume": (_a_volume_max, "volume to 100%", "audio-volume-high"),
+    "volume max": (_a_volume_max, "volume to 100%", "audio-volume-high"),
+    "full volume": (_a_volume_max, "volume to 100%", "audio-volume-high"),
+    "vol max": (_a_volume_max, "volume to 100%", "audio-volume-high"),
+    "min volume": (_a_volume_min, "volume to 0%", "audio-volume-muted"),
+    "volume min": (_a_volume_min, "volume to 0%", "audio-volume-muted"),
+    "vol min": (_a_volume_min, "volume to 0%", "audio-volume-muted"),
+    "half volume": (_a_volume_half, "volume to 50%", "audio-volume-medium"),
+    "volume half": (_a_volume_half, "volume to 50%", "audio-volume-medium"),
+    "vol half": (_a_volume_half, "volume to 50%", "audio-volume-medium"),
+    "wifi on": (_a_wifi_on, "wifi on", "network-wireless"),
+    "wifi off": (_a_wifi_off, "wifi off", "network-wireless-disconnected"),
+    "bluetooth on": (_a_bluetooth_on, "bluetooth on", "preferences-system-bluetooth"),
+    "bt on": (_a_bluetooth_on, "bluetooth on", "preferences-system-bluetooth"),
+    "bluetooth off": (_a_bluetooth_off, "bluetooth off", "preferences-system-bluetooth"),
+    "bt off": (_a_bluetooth_off, "bluetooth off", "preferences-system-bluetooth"),
+    "brightness up": (_a_brightness_up, "brightness up", "video-display"),
+    "brightness down": (_a_brightness_down, "brightness down", "video-display"),
+    "suspend": (_a_suspend, "suspend", "system-suspend"),
+    "sleep": (_a_suspend, "suspend", "system-suspend"),
+    "dark": (_a_theme_dark, "dark theme (nix-noir)", "preferences-desktop-color"),
+    "dark mode": (_a_theme_dark, "dark theme (nix-noir)", "preferences-desktop-color"),
+    "light": (_a_theme_light, "light theme (breeze)", "preferences-desktop-color"),
+    "light mode": (_a_theme_light, "light theme (breeze)", "preferences-desktop-color"),
+    "dnd": (_a_dnd_toggle, "toggle do-not-disturb", "notifications-disabled"),
+    "do not disturb": (_a_dnd_toggle, "toggle do-not-disturb", "notifications-disabled"),
+    "silent": (_a_dnd_toggle, "toggle do-not-disturb", "notifications-disabled"),
+    "quiet": (_a_dnd_toggle, "toggle do-not-disturb", "notifications-disabled"),
+    "night": (_a_night_toggle, "toggle night light", "redshift-status-on"),
+    "night light": (_a_night_toggle, "toggle night light", "redshift-status-on"),
+    "night mode": (_a_night_toggle, "toggle night light", "redshift-status-on"),
+    "screenshot": (_a_screenshot, "screenshot (fullscreen → clipboard)", "ksnapshot"),
+    "screen": (_a_screenshot, "screenshot (fullscreen → clipboard)", "ksnapshot"),
+    "shot": (_a_screenshot, "screenshot (fullscreen → clipboard)", "ksnapshot"),
+    "snapshot": (_a_snapshot, "snapper snapshot", "drive-harddisk"),
+    "snap": (_a_snapshot, "snapper snapshot", "drive-harddisk"),
+    "airplane": (_a_airplane_on, "airplane mode on (wifi + bluetooth off)", "flightmode"),
+    "airplane on": (_a_airplane_on, "airplane mode on (wifi + bluetooth off)", "flightmode"),
+    "airplane mode": (_a_airplane_on, "airplane mode on (wifi + bluetooth off)", "flightmode"),
+    "airplane off": (_a_airplane_off, "airplane mode off (wifi + bluetooth on)", "network-wireless"),
+}
+
+
+_VOLUME_SET_PATTERN = re.compile(r"^(?:volume|vol)\s+(\d{1,3})%?$", re.IGNORECASE)
+
+
+def try_action(q):
+    ql = q.lower().strip()
+    entry = ACTIONS.get(ql)
+    if entry:
+        handler, label, icon = entry
+        return (ql, label, icon)
+
+    # Pattern: "volume 50" / "vol 75%" → volume-set-<N>
+    m = _VOLUME_SET_PATTERN.match(ql)
+    if m:
+        pct = max(0, min(100, int(m.group(1))))
+        return (f"volume-set-{pct}", f"volume to {pct}%", "audio-volume-high")
+
+    return None
+
+
+# ─── pass-through detectors ─────────────────────────────────────
+
+def is_single_word_app(q):
+    if " " in q:
+        return False
+    if len(q) < 2:
+        return False
+    return shutil.which(q) is not None
+
+
+def is_path_query(q):
+    if q.startswith(("/", "~/", "./", "../")):
+        return True
+    if q == "~":
+        return True
+    if re.match(r"^\.[\w\-]+$", q):
+        return True
+    return False
+
+
+# ─── DBus service ───────────────────────────────────────────────
+
+class NixRunner(dbus.service.Object):
+    def __init__(self, bus_name):
+        super().__init__(bus_name, OBJ_PATH)
+
+    @dbus.service.method(
+        IFACE,
+        in_signature="s",
+        out_signature="a(sssida{sv})",
+    )
+    def Match(self, query):
+        q = (query or "").strip()
+        if len(q) < MIN_QUERY_LEN:
+            return []
+
+        # 1. Math
+        math_result = try_math(q)
+        if math_result is not None:
+            return [self._math_match(q, math_result)]
+
+        # 2. Unit conversion
+        unit_result = try_unit(q)
+        if unit_result is not None:
+            return [self._unit_match(unit_result)]
+
+        # 3. State query
+        state_result = try_state_query(q)
+        if state_result is not None:
+            text, icon = state_result
+            return [self._state_match(q, text, icon)]
+
+        # 4. Action
+        action_result = try_action(q)
+        if action_result is not None:
+            key, label, icon = action_result
+            return [self._action_match(key, label, icon)]
+
+        # 5. Pass-through: single-word binary
+        if is_single_word_app(q):
+            return []
+
+        # 6. Pass-through: path-like
+        if is_path_query(q):
+            return []
+
+        # 7. Fallback: ask nix
+        return [self._ask_nix_match(q)]
+
+    @dbus.service.method(IFACE, out_signature="a(sss)")
+    def Actions(self):
+        return []
+
+    @dbus.service.method(IFACE, in_signature="ss")
+    def Run(self, match_id, action_id):
+        if match_id.startswith("math::"):
+            payload = match_id[len("math::"):]
+            if "=" in payload:
+                _, result = payload.rsplit("=", 1)
+                self._copy_clipboard(result.strip())
+            return
+
+        if match_id.startswith("unit::"):
+            payload = match_id[len("unit::"):]
+            if " = " in payload:
+                _, result = payload.split(" = ", 1)
+                self._copy_clipboard(result.strip())
+            return
+
+        if match_id.startswith("state::"):
+            # state::<key>|<cached-text>  — copy the cached text
+            payload = match_id[len("state::"):]
+            if "|" in payload:
+                _, cached = payload.split("|", 1)
+                self._copy_clipboard(cached.strip())
+            return
+
+        if match_id.startswith("action::"):
+            key = match_id[len("action::"):]
+            # Pattern-based volume-set: "volume-set-<N>"
+            if key.startswith("volume-set-"):
+                try:
+                    pct = int(key[len("volume-set-"):])
+                    _a_volume_set(pct)
+                except Exception:
+                    pass
+                return
+            entry = ACTIONS.get(key.lower())
+            if entry:
+                handler = entry[0]
+                try:
+                    handler()
+                except Exception:
+                    pass
+            return
+
+        if match_id.startswith("nix::"):
+            query = match_id[len("nix::"):]
+            if not query:
+                return
+            self._summon_nix(query)
+            return
+
+    @dbus.service.method(IFACE)
+    def Teardown(self):
+        pass
+
+    # ─── match builders ─────────────────────────────────────
+
+    def _math_match(self, q, result):
+        return (
+            f"math::{q}={result}",
+            f"{q} = {result}",
+            "accessories-calculator",
+            dbus.Int32(100),
+            1.0,
+            dbus.Dictionary({"subtext": "press enter to copy result"}, signature="sv"),
+        )
+
+    def _unit_match(self, result):
+        return (
+            f"unit::{result}",
+            result,
+            "accessories-calculator",
+            dbus.Int32(100),
+            1.0,
+            dbus.Dictionary({"subtext": "press enter to copy result"}, signature="sv"),
+        )
+
+    def _state_match(self, key, text, icon):
+        return (
+            f"state::{key}|{text}",
+            text,
+            icon,
+            dbus.Int32(100),
+            1.0,
+            dbus.Dictionary({"subtext": "press enter to copy"}, signature="sv"),
+        )
+
+    def _action_match(self, key, label, icon):
+        return (
+            f"action::{key}",
+            f"▸ {label}",
+            icon,
+            dbus.Int32(100),
+            1.0,
+            dbus.Dictionary({"subtext": "press enter to execute"}, signature="sv"),
+        )
+
+    def _ask_nix_match(self, q):
+        return (
+            f"nix::{q}",
+            f"ask nix: {q}",
+            "utilities-terminal",
+            dbus.Int32(70),
+            0.8,
+            dbus.Dictionary({"subtext": "summon nix with this question"}, signature="sv"),
+        )
+
+    # ─── action helpers ─────────────────────────────────────
+
+    def _copy_clipboard(self, text):
+        try:
+            subprocess.run(
+                ["xclip", "-selection", "clipboard", "-i"],
+                input=text, text=True, timeout=1, check=False,
+            )
+            subprocess.run(
+                ["xclip", "-selection", "primary", "-i"],
+                input=text, text=True, timeout=1, check=False,
+            )
+        except Exception:
+            pass
+
+    def _summon_nix(self, query):
+        os.makedirs(os.path.dirname(PENDING), exist_ok=True)
+        with open(PENDING, "w") as f:
+            f.write(query)
+
+        yakuake_visible = self._yakuake_visible()
+
+        if not yakuake_visible and os.access(CAPTURE, os.X_OK):
+            self._call([CAPTURE])
+
+        self._call(["qdbus6", "org.kde.yakuake", "/yakuake/sessions", "addSession"])
+
+        if not yakuake_visible:
+            self._call(
+                ["qdbus6", "org.kde.yakuake", "/yakuake/window", "toggleWindowState"]
+            )
+
+    def _yakuake_visible(self):
+        try:
+            r = subprocess.run(
+                ["xdotool", "search", "--onlyvisible", "--class", "yakuake"],
+                capture_output=True, text=True, timeout=1,
+            )
+            return bool(r.stdout.strip())
+        except Exception:
+            return False
+
+    def _call(self, argv):
+        try:
+            subprocess.run(
+                argv, timeout=2, check=False,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+
+def main():
+    DBusGMainLoop(set_as_default=True)
+    bus = dbus.SessionBus()
+    name = dbus.service.BusName(BUS_NAME, bus=bus)
+    NixRunner(name)
+    GLib.MainLoop().run()
+
+
+if __name__ == "__main__":
+    main()

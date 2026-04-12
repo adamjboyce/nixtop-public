@@ -1,0 +1,14 @@
+[Desktop Entry]
+DefaultProfile=NixNoir.profile
+
+[General]
+ConfigVersion=1
+
+[Plugins]
+konsole_quickcommandspluginEnabled=false
+konsole_sshmanagerpluginEnabled=false
+quickcommandspluginEnabled=false
+sshmanagerpluginEnabled=false
+
+[UiSettings]
+ColorScheme=

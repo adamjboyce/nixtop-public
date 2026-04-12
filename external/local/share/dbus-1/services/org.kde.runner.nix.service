@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=org.kde.runner.nix
+Exec=/home/jolly/.nix/bin/nix-krunner

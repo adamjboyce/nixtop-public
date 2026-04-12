@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────
+#   nix-capture-context — summon-as-snapshot
+#   Captures a moment in time for nix to wake up inside.
+#   Fires from nix() before claude launches.
+# ─────────────────────────────────────────────────────────────
+set -u
+
+CTX_ROOT="${HOME}/.nix/ctx"
+LATEST="${CTX_ROOT}/latest"
+STAMP=$(date '+%Y-%m-%d_%H-%M-%S')
+SNAP_DIR="${CTX_ROOT}/${STAMP}"
+
+mkdir -p "$SNAP_DIR"
+
+# 1. Screenshot — full desktop, no notify, overwrite
+# spectacle -b (background), -n (no notify), -f (fullscreen), -o path
+spectacle -b -n -f -o "${SNAP_DIR}/screen.png" >/dev/null 2>&1 &
+SPECTACLE_PID=$!
+
+# 2. Clipboard (Ctrl+C buffer)
+xclip -selection clipboard -o 2>/dev/null > "${SNAP_DIR}/clipboard.txt" || : > "${SNAP_DIR}/clipboard.txt"
+
+# 3. Primary selection (highlighted text)
+xclip -selection primary -o 2>/dev/null > "${SNAP_DIR}/selection.txt" || : > "${SNAP_DIR}/selection.txt"
+
+# 4. Active window info
+{
+    wid=$(xdotool getactivewindow 2>/dev/null)
+    if [ -n "$wid" ]; then
+        printf 'id: %s\n' "$wid"
+        printf 'title: %s\n' "$(xdotool getwindowname "$wid" 2>/dev/null)"
+        printf 'class: %s\n' "$(xdotool getwindowclassname "$wid" 2>/dev/null)"
+        printf 'geometry: %s\n' "$(xdotool getwindowgeometry --shell "$wid" 2>/dev/null | paste -sd' ')"
+    fi
+    printf 'desktop: %s\n' "$(xdotool get_desktop 2>/dev/null)"
+} > "${SNAP_DIR}/window.txt" 2>/dev/null
+
+# 5. Machine pulse — one line: cwd + hostname + timestamp
+{
+    printf 'stamp: %s\n' "$STAMP"
+    printf 'host: %s\n' "$(uname -n)"
+    printf 'user-cwd: %s\n' "$PWD"
+    printf 'user-shell-pid: %s\n' "${PPID}"
+} > "${SNAP_DIR}/meta.txt"
+
+# Wait up to 2s for spectacle to finish so the symlink points at a complete capture
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ -f "${SNAP_DIR}/screen.png" ] && break
+    sleep 0.1
+done
+# Detach spectacle if it's still running — we won't block forever
+kill -0 "$SPECTACLE_PID" 2>/dev/null && disown "$SPECTACLE_PID" 2>/dev/null
+
+# 6. Write a human-readable index so I can see at a glance what's here
+cat > "${SNAP_DIR}/INDEX.md" <<EOF
+# nix summon snapshot — ${STAMP}
+
+This directory is a frozen moment of Adam's machine at the instant he summoned nix.
+When Adam uses deictic language ("this", "that", "what I'm looking at", "the thing
+on screen", "that error", "what I just copied", "this selection"), check the files
+here first.
+
+## files
+
+- \`screen.png\` — full-screen screenshot at summon time
+- \`clipboard.txt\` — Ctrl+C clipboard contents
+- \`selection.txt\` — primary selection (highlighted text)
+- \`window.txt\` — active window title, class, geometry
+- \`meta.txt\` — timestamp, host, cwd, shell pid
+EOF
+
+# 7. Rotate: keep latest symlink pointing at newest snap, prune older than 10
+rm -f "$LATEST"
+ln -s "$SNAP_DIR" "$LATEST"
+
+# Prune — keep 10 most recent timestamped dirs
+cd "$CTX_ROOT" 2>/dev/null || exit 0
+ls -1dt 20*/ 2>/dev/null | tail -n +11 | xargs -r rm -rf

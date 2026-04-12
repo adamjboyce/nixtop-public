@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────
+#   nix-git — cloud-synced persistence for the nix environment
+#
+#   ~/.nix/ is a git repo. Files that live elsewhere on the
+#   system (~/.xbindkeysrc, ~/.claude/CLAUDE.md, plugin files
+#   under ~/.local/share, etc.) are mirrored into ~/.nix/external/
+#   via a manifest. `sync` copies out→in then git-add/commit/push.
+#   `pull` git-pulls then copies in→out.
+#
+#   Bootstrap on a fresh machine: git clone <repo> ~/.nix, then
+#   ~/.nix/bootstrap.sh to lay external files down and wire the
+#   shell integration.
+# ─────────────────────────────────────────────────────────────
+set -u
+
+NIX_ROOT="$HOME/.nix"
+EXT_ROOT="$NIX_ROOT/external"
+
+# Catppuccin mocha palette (truecolor) for output
+C_PINK=$'\033[38;2;245;194;231m'
+C_MAUVE=$'\033[38;2;203;166;247m'
+C_TEXT=$'\033[38;2;205;214;244m'
+C_MUTED=$'\033[38;2;127;132;156m'
+C_RED=$'\033[38;2;243;139;168m'
+C_GREEN=$'\033[38;2;166;227;161m'
+C_RESET=$'\033[0m'
+
+chev() { printf '%s❯%s ' "$C_PINK" "$C_RESET"; }
+say() { chev; printf '%s\n' "$*"; }
+warn() { chev; printf '%s%s%s\n' "$C_RED" "$*" "$C_RESET"; }
+muted() { printf '  %s%s%s\n' "$C_MUTED" "$*" "$C_RESET"; }
+
+# ─── manifest ──────────────────────────────────────────────
+# Each line: <source-path> <dest-relative-to-external/>
+# Source paths may begin with ~ (expanded at runtime).
+
+manifest() {
+    cat <<'EOF'
+~/.xbindkeysrc xbindkeysrc
+~/.config/yakuakerc config/yakuakerc
+~/.config/konsolerc config/konsolerc
+~/.config/autostart/nix.desktop config/autostart/nix.desktop
+~/.config/autostart/yakuake.desktop config/autostart/yakuake.desktop
+~/.config/kglobalshortcutsrc config/kglobalshortcutsrc
+~/.local/share/yakuake/skins/nix-noir local/share/yakuake/skins/nix-noir
+~/.local/share/konsole/NixNoir.profile local/share/konsole/NixNoir.profile
+~/.local/share/konsole/NixNoir.colorscheme local/share/konsole/NixNoir.colorscheme
+~/.local/share/krunner/dbusplugins/plasma-runner-nix.desktop local/share/krunner/dbusplugins/plasma-runner-nix.desktop
+~/.local/share/dbus-1/services/org.kde.runner.nix.service local/share/dbus-1/services/org.kde.runner.nix.service
+~/.local/share/plasma/look-and-feel/nix-noir local/share/plasma/look-and-feel/nix-noir
+~/.claude/CLAUDE.md claude/CLAUDE.md
+EOF
+}
+
+expand_tilde() {
+    printf '%s' "${1/#\~/$HOME}"
+}
+
+# Copy source → external mirror
+copy_out() {
+    local src dst
+    src=$(expand_tilde "$1")
+    dst="$EXT_ROOT/$2"
+    [ -e "$src" ] || return 0
+    mkdir -p "$(dirname "$dst")"
+    if [ -d "$src" ]; then
+        rsync -a --delete "$src/" "$dst/"
+    else
+        cp -a "$src" "$dst"
+    fi
+}
+
+# Copy external mirror → source
+copy_in() {
+    local src dst
+    src="$EXT_ROOT/$2"
+    dst=$(expand_tilde "$1")
+    [ -e "$src" ] || return 0
+    mkdir -p "$(dirname "$dst")"
+    if [ -d "$src" ]; then
+        rsync -a "$src/" "$dst/"
+    else
+        cp -a "$src" "$dst"
+    fi
+}
+
+# Walk the manifest with a given operation (copy_out | copy_in)
+walk() {
+    local op=$1
+    while IFS=' ' read -r src dst; do
+        [ -z "$src" ] && continue
+        "$op" "$src" "$dst"
+    done < <(manifest)
+}
+
+# ─── subcommands ───────────────────────────────────────────
+
+nix_git_init() {
+    if [ -d "$NIX_ROOT/.git" ]; then
+        warn "already a git repo at $NIX_ROOT"
+        return 1
+    fi
+    local remote="${1:-}"
+    say "initializing $NIX_ROOT as a git repo"
+    cd "$NIX_ROOT" || return 1
+    git init -q -b main
+    cat > "$NIX_ROOT/.gitignore" <<'EOF'
+# ephemeral / regenerable
+ctx/
+*.pyc
+__pycache__/
+.DS_Store
+
+# logs and caches
+*.log
+*.cache
+
+# the git repo itself
+.git/
+EOF
+
+    # Mirror external files in immediately so the first commit has everything
+    mkdir -p "$EXT_ROOT"
+    walk copy_out
+
+    # Drop a bootstrap script so the repo can self-restore
+    cat > "$NIX_ROOT/bootstrap.sh" <<'BOOT'
+#!/usr/bin/env bash
+# Run this once on a fresh machine, after: git clone <url> ~/.nix
+# It places mirrored external files back into their real homes and
+# wires ~/.bashrc to source ~/.nix/nix-shell.sh if not already.
+set -eu
+NIX_ROOT="$HOME/.nix"
+exec "$NIX_ROOT/bin/nix-git" pull --restore-only
+BOOT
+    chmod +x "$NIX_ROOT/bootstrap.sh"
+
+    git add -A
+    git -c user.name=nix -c user.email=nix@home commit -q -m "init: nix state snapshot"
+
+    if [ -n "$remote" ]; then
+        git remote add origin "$remote"
+        say "remote 'origin' set to $remote"
+        muted "push with: nix :git sync"
+    else
+        say "no remote set — add one with:"
+        muted "cd ~/.nix && git remote add origin <url>"
+    fi
+    say "repo ready"
+}
+
+nix_git_sync() {
+    [ -d "$NIX_ROOT/.git" ] || { warn "not a repo — run: nix :git init"; return 1; }
+    cd "$NIX_ROOT" || return 1
+
+    say "mirroring external files → $EXT_ROOT"
+    walk copy_out
+
+    # Any changes to commit?
+    if git diff --quiet && git diff --cached --quiet && [ -z "$(git ls-files --others --exclude-standard)" ]; then
+        say "nothing to sync — already up to date"
+        return 0
+    fi
+
+    git add -A
+    local stamp
+    stamp=$(date '+%Y-%m-%d %H:%M')
+    local msg="${1:-sync: $stamp}"
+    git -c user.name=nix -c user.email=nix@home commit -q -m "$msg"
+    say "committed: $msg"
+
+    if git remote get-url origin >/dev/null 2>&1; then
+        if git push -q 2>&1; then
+            say "pushed to origin"
+        else
+            warn "push failed — check auth / network / upstream"
+            muted "set upstream with: cd ~/.nix && git push -u origin main"
+            return 1
+        fi
+    else
+        muted "no remote configured — commit is local only"
+    fi
+}
+
+nix_git_pull() {
+    [ -d "$NIX_ROOT/.git" ] || { warn "not a repo — run: nix :git init"; return 1; }
+    cd "$NIX_ROOT" || return 1
+
+    local restore_only=0
+    if [ "${1:-}" = "--restore-only" ]; then
+        restore_only=1
+    fi
+
+    if [ "$restore_only" = "0" ]; then
+        if git remote get-url origin >/dev/null 2>&1; then
+            say "pulling from origin"
+            git pull -q --ff-only || { warn "pull failed"; return 1; }
+        else
+            muted "no remote — skipping git pull, restoring from local mirror"
+        fi
+    fi
+
+    say "restoring external files from $EXT_ROOT"
+    walk copy_in
+    say "pull complete"
+}
+
+nix_git_status() {
+    [ -d "$NIX_ROOT/.git" ] || { warn "not a repo — run: nix :git init"; return 1; }
+    cd "$NIX_ROOT" || return 1
+
+    # Refresh mirror so status reflects the current state of external files
+    walk copy_out
+
+    local stamp branch remote ahead behind
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || printf '(none)')
+    remote=$(git remote get-url origin 2>/dev/null || printf '(none)')
+    stamp=$(git log -1 --format='%cr — %s' 2>/dev/null || printf '(no commits)')
+
+    say "nix :git status"
+    printf '  %sbranch%s  %s\n' "$C_MUTED" "$C_RESET" "$branch"
+    printf '  %sremote%s  %s\n' "$C_MUTED" "$C_RESET" "$remote"
+    printf '  %slast%s    %s\n' "$C_MUTED" "$C_RESET" "$stamp"
+
+    if git remote get-url origin >/dev/null 2>&1; then
+        if git fetch -q 2>/dev/null; then
+            ahead=$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+            behind=$(git rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)
+            printf '  %ssync%s    ahead %s, behind %s\n' "$C_MUTED" "$C_RESET" "$ahead" "$behind"
+        fi
+    fi
+
+    printf '\n'
+    local pending
+    pending=$(git status --porcelain | wc -l)
+    if [ "$pending" -gt 0 ]; then
+        printf '  %s%d local change(s) not yet synced:%s\n' "$C_RED" "$pending" "$C_RESET"
+        git status --short | head -20 | sed 's/^/    /'
+    else
+        printf '  %sclean%s\n' "$C_GREEN" "$C_RESET"
+    fi
+}
+
+nix_git_log() {
+    [ -d "$NIX_ROOT/.git" ] || { warn "not a repo"; return 1; }
+    cd "$NIX_ROOT" || return 1
+    local n="${1:-20}"
+    git log --oneline --color=always -n "$n"
+}
+
+nix_git_diff() {
+    [ -d "$NIX_ROOT/.git" ] || { warn "not a repo"; return 1; }
+    cd "$NIX_ROOT" || return 1
+    walk copy_out
+    git diff --color=always "$@"
+}
+
+nix_git_help() {
+    chev; printf 'nix :git — cloud-synced state\n\n'
+    printf '  %s:git init [url]%s       initialize ~/.nix as a repo, optional remote\n' "$C_MUTED" "$C_RESET"
+    printf '  %s:git sync [msg]%s       mirror external files, commit, push\n' "$C_MUTED" "$C_RESET"
+    printf '  %s:git pull%s             pull + restore external files to disk\n' "$C_MUTED" "$C_RESET"
+    printf '  %s:git status%s           branch, remote, ahead/behind, pending changes\n' "$C_MUTED" "$C_RESET"
+    printf '  %s:git log [N]%s          last N commits (default 20)\n' "$C_MUTED" "$C_RESET"
+    printf '  %s:git diff%s             show uncommitted deltas\n' "$C_MUTED" "$C_RESET"
+    printf '  %s:git help%s             this\n\n' "$C_MUTED" "$C_RESET"
+    printf '  %sfresh-machine restore:%s\n' "$C_MUTED" "$C_RESET"
+    printf '    git clone <url> ~/.nix && ~/.nix/bootstrap.sh\n'
+}
+
+# ─── dispatch ──────────────────────────────────────────────
+
+case "${1:-status}" in
+    init)    shift; nix_git_init    "$@" ;;
+    sync)    shift; nix_git_sync    "$@" ;;
+    pull)    shift; nix_git_pull    "$@" ;;
+    status)  shift; nix_git_status  "$@" ;;
+    log)     shift; nix_git_log     "$@" ;;
+    diff)    shift; nix_git_diff    "$@" ;;
+    help|-h|--help) nix_git_help ;;
+    *)
+        warn "nix :git — unknown subcommand: $1"
+        nix_git_help
+        exit 1
+        ;;
+esac

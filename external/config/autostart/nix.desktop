@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Nix
+Comment=Open a Nix conversation on login
+Exec=konsole --separate -e bash -lc nix
+Icon=utilities-terminal
+Terminal=false
+X-GNOME-Autostart-enabled=true
+OnlyShowIn=KDE;
+X-KDE-autostart-after=panel

@@ -1,0 +1,14 @@
+# ─────────────────────────────────────────────────────────────
+#   xbindkeysrc — nix
+# ─────────────────────────────────────────────────────────────
+# Earlier b:3 hack (right-click=paste-in-Konsole / re-synth elsewhere)
+# was removed 2026-04-11: the synthetic re-click blocked GTK/Qt context
+# menus. Middle-click paste + Ctrl+Shift+V cover Konsole pasting natively.
+
+# F12 → nix-summon: capture context snapshot, then toggle yakuake.
+"/home/jolly/.nix/bin/nix-summon"
+  F12
+
+# Ctrl+Super+H → hollywood. drama on demand.
+"/home/jolly/.local/bin/nix-hollywood"
+  control + mod4 + h

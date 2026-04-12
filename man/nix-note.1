@@ -1,0 +1,134 @@
+.TH NIX-NOTE 1 "2026-04-11" "nix 1.0" "User Commands"
+.SH NAME
+nix-note \- append timestamped entries to nix memory files
+.SH SYNOPSIS
+.B nix :note
+.RI [ CATEGORY ]
+.RI [ TEXT .\|.\|.]
+.br
+.B nix :note
+.RB help | -h | --help
+.SH DESCRIPTION
+.B :note
+is a shellside handle for writing to the nix memory system at
+.IR ~/.nix/memory/ .
+It appends a timestamped markdown entry to a target file, or opens the target in
+.B $EDITOR
+when no text is supplied.
+
+Each written entry takes the form:
+.PP
+.RS
+.nf
+## [YYYY-MM-DD HH:MM] <subject>
+<full body, if longer than the subject>
+.fi
+.RE
+.PP
+The subject is the full text if it is 60 characters or fewer; otherwise it is
+truncated at a word boundary and followed by an ellipsis, and the full text is
+written on the line below. This keeps the memory file scannable by header while
+preserving the complete note.
+.SH CATEGORIES
+If the first argument matches a known category, the entry is routed to the
+corresponding file. Otherwise the entry is written to
+.IR notes.md ,
+which is created on first use.
+.TP
+.B learn
+.IR ~/.nix/memory/learnings.md
+.\" technical discoveries, fixes, gotchas
+.TP
+.B pref
+.IR ~/.nix/memory/preferences.md
+.\" how Adam works \- tool choices, style, pet peeves
+.TP
+.B project
+.IR ~/.nix/memory/projects.md
+.\" project context, active work, structure
+.TP
+.B feedback
+.IR ~/.nix/memory/feedback.md
+.\" corrections and calibration
+.TP
+.B system
+.IR ~/.nix/memory/system.md
+.\" installed, configured, customized on this machine
+.TP
+.I (none)
+.IR ~/.nix/memory/notes.md
+.\" default scratch target
+.SH OPTIONS
+.TP
+.BR help ", " -h ", " --help
+Print a short usage summary and exit. For the full reference, read this page.
+.SH EXAMPLES
+.PP
+Drop a stray thought into scratch notes:
+.PP
+.RS
+.EX
+nix :note "try btop's gpu panel next time"
+.EE
+.RE
+.PP
+Log a technical discovery to learnings:
+.PP
+.RS
+.EX
+nix :note learn "tumbleweed uptime has no -p flag, parse /proc/uptime directly"
+.EE
+.RE
+.PP
+Record a preference that should stick:
+.PP
+.RS
+.EX
+nix :note pref "right-click=paste is non-negotiable in any terminal"
+.EE
+.RE
+.PP
+Open the learnings file in
+.B $EDITOR
+for a longer-form entry:
+.PP
+.RS
+.EX
+nix :note learn
+.EE
+.RE
+.SH FILES
+.TP
+.I ~/.nix/memory/
+Root of the nix memory system. All category files live here.
+.TP
+.I ~/.nix/memory/notes.md
+Default scratch target. Created on first use if missing.
+.TP
+.I ~/.nix/nix-shell.sh
+Source for the
+.B nix
+function and its subcommands, including
+.BR :note .
+.TP
+.I ~/.nix/man/nix-note.1
+Source for this man page. Installed to
+.I /usr/local/man/man1/
+for
+.B man
+discovery.
+.SH ENVIRONMENT
+.TP
+.B EDITOR
+Invoked when
+.B :note
+is called without text, to edit the target file directly. Defaults to
+.B vi
+if unset.
+.SH SEE ALSO
+.BR nix (1),
+.BR snapper (8),
+.BR date (1)
+.SH AUTHOR
+Nix, with Adam. This is the shellside memory writer that keeps me coherent
+across sessions. Use it liberally \- memory is cheap, forgetting is not.

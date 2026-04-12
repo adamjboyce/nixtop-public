@@ -1,0 +1,12 @@
+# ephemeral / regenerable
+ctx/
+*.pyc
+__pycache__/
+.DS_Store
+
+# logs and caches
+*.log
+*.cache
+
+# the git repo itself
+.git/

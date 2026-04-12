@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────
+#   nix-summon — intercept F12, capture context, then toggle yakuake
+#
+#   Bound to F12 via xbindkeys. Captures a clean pre-summon
+#   snapshot (screenshot doesn't include yakuake because yakuake
+#   isn't visible yet) then DBus-toggles yakuake's visibility.
+#
+#   On dismiss (yakuake already visible): skip capture, just hide.
+# ─────────────────────────────────────────────────────────────
+set -u
+
+CAPTURE="$HOME/.nix/bin/nix-capture-context"
+
+# If yakuake has no visible window, we're about to show — capture first.
+# xdotool --onlyvisible filters to windows currently mapped on screen.
+if ! xdotool search --onlyvisible --class yakuake 2>/dev/null | grep -q .; then
+    [ -x "$CAPTURE" ] && "$CAPTURE" >/dev/null 2>&1
+fi
+
+# Toggle yakuake (show if hidden, hide if visible).
+qdbus6 org.kde.yakuake /yakuake/window toggleWindowState 2>/dev/null

@@ -1,0 +1,20 @@
+[Desktop Entry]
+Name=Nix
+Comment=Route queries to a nix session
+Icon=utilities-terminal
+Type=Service
+X-KDE-ServiceTypes=Plasma/Runner
+
+X-KDE-PluginInfo-Author=Nix
+X-KDE-PluginInfo-Email=nix@home
+X-KDE-PluginInfo-Name=nix
+X-KDE-PluginInfo-Version=1.0
+X-KDE-PluginInfo-License=MIT
+X-KDE-PluginInfo-EnabledByDefault=true
+
+X-Plasma-API=DBus
+X-Plasma-DBusRunner-Service=org.kde.runner.nix
+X-Plasma-DBusRunner-Path=/nix
+
+X-Plasma-Runner-Syntaxes=:q:
+X-Plasma-Runner-Syntax-Descriptions=Summon nix with :q: as the first prompt
