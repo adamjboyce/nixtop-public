@@ -1,0 +1,709 @@
+#!/home/jolly/.nix/memory/.venv/bin/python3
+# ─────────────────────────────────────────────────────────────
+#   nix-memory — semantic memory system for Nix
+#
+#   Stores, indexes, searches, and curates memory entries using
+#   sentence embeddings (all-MiniLM-L6-v2) + SQLite + sqlite-vec.
+#
+#   Markdown files remain source of truth. SQLite is the index.
+#
+#   Usage:
+#     nix-memory index              — rebuild index from markdown files
+#     nix-memory recall <query>     — semantic search
+#     nix-memory recall --recent N  — last N entries by timestamp
+#     nix-memory ingest <text> [--file learnings] — add entry + embed
+#     nix-memory clusters           — show detected similar-memory clusters
+#     nix-memory curate             — dump cluster data as JSON (diagnostic)
+# ─────────────────────────────────────────────────────────────
+
+import sys
+import os
+import re
+import json
+import struct
+import sqlite3
+import hashlib
+from pathlib import Path
+from datetime import datetime
+from typing import Optional
+
+import sqlite_vec
+import numpy as np
+
+# ── paths ────────────────────────────────────────────────────
+MEMORY_DIR = Path.home() / ".nix" / "memory"
+DB_PATH = MEMORY_DIR / "nix-memory.db"
+MEMORY_FILES = ["preferences.md", "system.md", "learnings.md", "projects.md", "feedback.md"]
+ARCHIVE_DIR = MEMORY_DIR / "archive"
+
+# ── palette (catppuccin mocha) ───────────────────────────────
+C_RESET = "\033[0m"
+C_MAUVE = "\033[38;2;203;166;247m"
+C_PINK = "\033[38;2;245;194;231m"
+C_TEXT = "\033[38;2;205;214;244m"
+C_OVERLAY = "\033[38;2;127;132;156m"
+C_GREEN = "\033[38;2;166;227;161m"
+C_RED = "\033[38;2;243;139;168m"
+C_PEACH = "\033[38;2;250;179;135m"
+C_DIM = "\033[2m"
+
+# ── model (lazy-loaded) ─────────────────────────────────────
+_model = None
+
+def get_model():
+    global _model
+    if _model is None:
+        # suppress noisy HF warnings
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        import warnings
+        warnings.filterwarnings("ignore", category=FutureWarning)
+        from sentence_transformers import SentenceTransformer
+        _model = SentenceTransformer("all-MiniLM-L6-v2")
+    return _model
+
+
+def embed(text: str) -> bytes:
+    """Embed text, return as raw float32 bytes for sqlite-vec."""
+    vec = get_model().encode(text, normalize_embeddings=True)
+    return vec.astype(np.float32).tobytes()
+
+
+# ── database ─────────────────────────────────────────────────
+
+def get_db() -> sqlite3.Connection:
+    db = sqlite3.connect(str(DB_PATH))
+    db.enable_load_extension(True)
+    sqlite_vec.load(db)
+    db.enable_load_extension(False)
+    db.execute("PRAGMA journal_mode=WAL")
+    _ensure_schema(db)
+    return db
+
+
+def _ensure_schema(db: sqlite3.Connection):
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_file TEXT NOT NULL,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            timestamp TEXT,
+            content_hash TEXT NOT NULL UNIQUE,
+            created_at TEXT DEFAULT (datetime('now')),
+            cluster_id INTEGER,
+            archived INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_entries_source ON entries(source_file);
+        CREATE INDEX IF NOT EXISTS idx_entries_cluster ON entries(cluster_id);
+        CREATE INDEX IF NOT EXISTS idx_entries_hash ON entries(content_hash);
+    """)
+    # virtual table for vec search — 384 dims for MiniLM
+    try:
+        db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS entries_vec USING vec0(embedding float[384])")
+    except sqlite3.OperationalError:
+        pass  # already exists
+    db.commit()
+
+
+# ── markdown parsing ─────────────────────────────────────────
+
+def parse_memory_file(filepath: Path) -> list[dict]:
+    """Parse a memory markdown file into entries.
+
+    Each entry starts with ## [date] Title and runs until the next ## or EOF.
+    """
+    if not filepath.exists():
+        return []
+
+    text = filepath.read_text(encoding="utf-8")
+    entries = []
+
+    # split on ## headers
+    pattern = r'^## \[([^\]]+)\]\s*(.*?)$'
+    parts = re.split(r'(?=^## \[)', text, flags=re.MULTILINE)
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        match = re.match(pattern, part, re.MULTILINE)
+        if not match:
+            continue
+
+        timestamp_str = match.group(1).strip()
+        title = match.group(2).strip()
+        body = part[match.end():].strip()
+
+        entries.append({
+            "source_file": filepath.name,
+            "title": title,
+            "body": body,
+            "timestamp": timestamp_str,
+            "content_hash": hashlib.sha256((title + body).encode()).hexdigest()[:16],
+        })
+
+    return entries
+
+
+# ── commands ─────────────────────────────────────────────────
+
+def cmd_index(args):
+    """Rebuild the full index from markdown files."""
+    db = get_db()
+
+    # parse all entries
+    all_entries = []
+    for fname in MEMORY_FILES:
+        filepath = MEMORY_DIR / fname
+        entries = parse_memory_file(filepath)
+        all_entries.extend(entries)
+        print(f"  {C_OVERLAY}{fname}: {len(entries)} entries{C_RESET}")
+
+    if not all_entries:
+        print(f"{C_RED}no entries found{C_RESET}")
+        return
+
+    # check what's already indexed
+    existing = set(r[0] for r in db.execute("SELECT content_hash FROM entries").fetchall())
+    new_entries = [e for e in all_entries if e["content_hash"] not in existing]
+
+    if not new_entries:
+        print(f"\n  {C_GREEN}index up to date ({len(existing)} entries){C_RESET}")
+        return
+
+    print(f"\n  {C_MAUVE}embedding {len(new_entries)} new entries...{C_RESET}")
+
+    # embed all new entries at once (batched is faster)
+    texts = [f"{e['title']}\n{e['body']}" for e in new_entries]
+    model = get_model()
+    vectors = model.encode(texts, normalize_embeddings=True, show_progress_bar=len(texts) > 10)
+
+    # insert
+    for entry, vec in zip(new_entries, vectors):
+        cursor = db.execute(
+            "INSERT INTO entries (source_file, title, body, timestamp, content_hash) VALUES (?, ?, ?, ?, ?)",
+            (entry["source_file"], entry["title"], entry["body"], entry["timestamp"], entry["content_hash"])
+        )
+        row_id = cursor.lastrowid
+        db.execute(
+            "INSERT INTO entries_vec (rowid, embedding) VALUES (?, ?)",
+            (row_id, vec.astype(np.float32).tobytes())
+        )
+
+    db.commit()
+    total = db.execute("SELECT COUNT(*) FROM entries WHERE archived = 0").fetchone()[0]
+    print(f"  {C_GREEN}indexed {len(new_entries)} new, {total} total active entries{C_RESET}")
+
+
+def cmd_recall(args):
+    """Semantic search across memories."""
+    # parse flags
+    recent = False
+    recent_n = 10
+    file_filter = None
+    query_parts = []
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--recent":
+            recent = True
+            if i + 1 < len(args) and args[i + 1].isdigit():
+                recent_n = int(args[i + 1])
+                i += 1
+        elif args[i] == "--file" and i + 1 < len(args):
+            file_filter = args[i + 1]
+            if not file_filter.endswith(".md"):
+                file_filter += ".md"
+            i += 1
+        else:
+            query_parts.append(args[i])
+        i += 1
+
+    db = get_db()
+
+    if recent:
+        # time-based query
+        where = "WHERE archived = 0"
+        params = []
+        if file_filter:
+            where += " AND source_file = ?"
+            params.append(file_filter)
+        rows = db.execute(
+            f"SELECT id, source_file, title, body, timestamp FROM entries {where} ORDER BY timestamp DESC LIMIT ?",
+            params + [recent_n]
+        ).fetchall()
+        _print_results(rows, scores=None)
+        return
+
+    query = " ".join(query_parts)
+    if not query:
+        # no query — show index summary
+        rows = db.execute("""
+            SELECT source_file, COUNT(*) as cnt
+            FROM entries WHERE archived = 0
+            GROUP BY source_file ORDER BY cnt DESC
+        """).fetchall()
+        total = sum(r[1] for r in rows)
+        print(f"\n  {C_PINK}❯{C_RESET} {C_TEXT}memory index: {total} entries{C_RESET}\n")
+        for fname, count in rows:
+            print(f"    {C_OVERLAY}{fname:<20}{C_RESET} {C_MAUVE}{count}{C_RESET}")
+        print()
+        return
+
+    # semantic search
+    query_vec = embed(query)
+
+    where_clause = ""
+    params = []
+    if file_filter:
+        where_clause = "AND e.source_file = ?"
+        params = [file_filter]
+
+    rows = db.execute(f"""
+        SELECT e.id, e.source_file, e.title, e.body, e.timestamp, v.distance
+        FROM entries_vec v
+        JOIN entries e ON e.id = v.rowid
+        WHERE v.embedding MATCH ? AND k = 10
+        {where_clause}
+        AND e.archived = 0
+        ORDER BY v.distance ASC
+    """, [query_vec] + params).fetchall()
+
+    if not rows:
+        print(f"\n  {C_OVERLAY}no matches{C_RESET}\n")
+        return
+
+    _print_results(
+        [(r[0], r[1], r[2], r[3], r[4]) for r in rows],
+        scores=[1.0 - r[5] for r in rows]  # distance → similarity
+    )
+
+
+def _print_results(rows, scores=None):
+    """Pretty-print search results."""
+    if not rows:
+        print(f"\n  {C_OVERLAY}no results{C_RESET}\n")
+        return
+
+    print()
+    for i, (rid, source, title, body, ts) in enumerate(rows):
+        score_str = ""
+        if scores is not None:
+            s = scores[i]
+            color = C_GREEN if s > 0.5 else C_PEACH if s > 0.3 else C_OVERLAY
+            score_str = f" {color}{s:.2f}{C_RESET}"
+
+        # truncate body for display
+        body_preview = body.replace("\n", " ")[:120]
+        if len(body) > 120:
+            body_preview += "..."
+
+        print(f"  {C_PINK}❯{C_RESET} {C_MAUVE}{title}{C_RESET}{score_str}")
+        print(f"    {C_OVERLAY}{source} · {ts}{C_RESET}")
+        print(f"    {C_TEXT}{body_preview}{C_RESET}")
+        print()
+
+
+def cmd_ingest(args):
+    """Add a new memory entry and embed it."""
+    # parse --file flag
+    target_file = "learnings.md"
+    text_parts = []
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--file" and i + 1 < len(args):
+            target_file = args[i + 1]
+            if not target_file.endswith(".md"):
+                target_file += ".md"
+            i += 1
+        else:
+            text_parts.append(args[i])
+        i += 1
+
+    text = " ".join(text_parts)
+    if not text:
+        print(f"{C_RED}usage: nix-memory ingest <text> [--file <name>]{C_RESET}")
+        return
+
+    # generate timestamp
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # auto-title: first sentence or first 60 chars
+    title = text.split(". ")[0][:80]
+    if title == text[:80] and len(text) > 80:
+        title = title[:77] + "..."
+
+    body = text
+    content_hash = hashlib.sha256((title + body).encode()).hexdigest()[:16]
+
+    # append to markdown file
+    filepath = MEMORY_DIR / target_file
+    if filepath.exists():
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write(f"\n\n## [{ts}] {title}\n{body}\n")
+    else:
+        print(f"{C_RED}file not found: {target_file}{C_RESET}")
+        return
+
+    # embed and insert into db
+    db = get_db()
+    full_text = f"{title}\n{body}"
+    vec = embed(full_text)
+
+    cursor = db.execute(
+        "INSERT OR IGNORE INTO entries (source_file, title, body, timestamp, content_hash) VALUES (?, ?, ?, ?, ?)",
+        (target_file, title, body, ts, content_hash)
+    )
+    if cursor.lastrowid:
+        db.execute(
+            "INSERT INTO entries_vec (rowid, embedding) VALUES (?, ?)",
+            (cursor.lastrowid, vec)
+        )
+        db.commit()
+
+    print(f"  {C_GREEN}saved to {target_file} + indexed{C_RESET}")
+
+    # check for similar existing entries
+    similar = db.execute("""
+        SELECT e.title, v.distance
+        FROM entries_vec v
+        JOIN entries e ON e.id = v.rowid
+        WHERE v.embedding MATCH ? AND k = 4
+        AND e.content_hash != ?
+        AND e.archived = 0
+        ORDER BY v.distance ASC
+    """, [vec, content_hash]).fetchall()
+
+    close_matches = [(t, 1.0 - d) for t, d in similar if (1.0 - d) > 0.6]
+    if close_matches:
+        print(f"  {C_PEACH}similar entries ({len(close_matches)}):{C_RESET}")
+        for t, s in close_matches:
+            print(f"    {C_OVERLAY}{s:.2f} — {t}{C_RESET}")
+
+
+def cmd_clusters(args):
+    """Detect clusters of semantically similar memories."""
+    db = get_db()
+    threshold = 0.7  # cosine similarity threshold
+    min_cluster = 3
+
+    # parse args
+    for i, a in enumerate(args):
+        if a == "--threshold" and i + 1 < len(args):
+            threshold = float(args[i + 1])
+        if a == "--min" and i + 1 < len(args):
+            min_cluster = int(args[i + 1])
+
+    # load all active entries + embeddings
+    rows = db.execute("""
+        SELECT e.id, e.source_file, e.title, e.timestamp
+        FROM entries e WHERE e.archived = 0
+    """).fetchall()
+
+    if len(rows) < min_cluster:
+        print(f"  {C_OVERLAY}not enough entries for clustering ({len(rows)} < {min_cluster}){C_RESET}")
+        return
+
+    # get all embeddings
+    ids = [r[0] for r in rows]
+    vecs = []
+    for rid in ids:
+        raw = db.execute("SELECT embedding FROM entries_vec WHERE rowid = ?", [rid]).fetchone()
+        if raw:
+            vecs.append(np.frombuffer(raw[0], dtype=np.float32))
+        else:
+            vecs.append(np.zeros(384, dtype=np.float32))
+
+    vecs = np.stack(vecs)
+
+    # compute cosine similarity matrix (embeddings already normalized)
+    sim_matrix = vecs @ vecs.T
+
+    # greedy clustering: find connected components above threshold
+    n = len(ids)
+    visited = set()
+    clusters = []
+
+    for i in range(n):
+        if i in visited:
+            continue
+        cluster = [i]
+        visited.add(i)
+        for j in range(i + 1, n):
+            if j in visited:
+                continue
+            if sim_matrix[i, j] >= threshold:
+                cluster.append(j)
+                visited.add(j)
+        if len(cluster) >= min_cluster:
+            clusters.append(cluster)
+
+    if not clusters:
+        print(f"\n  {C_GREEN}no clusters above threshold ({threshold}) with {min_cluster}+ entries{C_RESET}\n")
+        return
+
+    print(f"\n  {C_PINK}❯{C_RESET} {C_TEXT}found {len(clusters)} cluster(s){C_RESET}\n")
+
+    for ci, cluster in enumerate(clusters):
+        # compute avg pairwise similarity
+        sims = []
+        for a in range(len(cluster)):
+            for b in range(a + 1, len(cluster)):
+                sims.append(sim_matrix[cluster[a], cluster[b]])
+        avg_sim = np.mean(sims) if sims else 0
+
+        print(f"  {C_MAUVE}cluster {ci + 1}{C_RESET} ({len(cluster)} entries, avg sim {avg_sim:.2f})")
+        for idx in cluster:
+            r = rows[idx]
+            print(f"    {C_OVERLAY}[{r[3]}]{C_RESET} {C_TEXT}{r[2][:70]}{C_RESET} {C_DIM}({r[1]}){C_RESET}")
+        print()
+
+
+def cmd_curate(args):
+    """Dump cluster data as JSON for diagnostic inspection."""
+    db = get_db()
+    threshold = 0.65
+    min_cluster = 3
+
+    for i, a in enumerate(args):
+        if a == "--threshold" and i + 1 < len(args):
+            threshold = float(args[i + 1])
+        if a == "--min" and i + 1 < len(args):
+            min_cluster = int(args[i + 1])
+
+    # same clustering as cmd_clusters
+    rows = db.execute("""
+        SELECT e.id, e.source_file, e.title, e.body, e.timestamp
+        FROM entries e WHERE e.archived = 0
+    """).fetchall()
+
+    ids = [r[0] for r in rows]
+    vecs = []
+    for rid in ids:
+        raw = db.execute("SELECT embedding FROM entries_vec WHERE rowid = ?", [rid]).fetchone()
+        if raw:
+            vecs.append(np.frombuffer(raw[0], dtype=np.float32))
+        else:
+            vecs.append(np.zeros(384, dtype=np.float32))
+
+    vecs = np.stack(vecs)
+    sim_matrix = vecs @ vecs.T
+
+    n = len(ids)
+    visited = set()
+    clusters = []
+
+    for i in range(n):
+        if i in visited:
+            continue
+        cluster = [i]
+        visited.add(i)
+        for j in range(i + 1, n):
+            if j in visited:
+                continue
+            if sim_matrix[i, j] >= threshold:
+                cluster.append(j)
+                visited.add(j)
+        if len(cluster) >= min_cluster:
+            clusters.append(cluster)
+
+    if not clusters:
+        print(json.dumps({"clusters": [], "message": "no clusters found"}))
+        return
+
+    output = {"clusters": []}
+    for ci, cluster in enumerate(clusters):
+        entries = []
+        for idx in cluster:
+            r = rows[idx]
+            entries.append({
+                "id": r[0],
+                "source_file": r[1],
+                "title": r[2],
+                "body": r[3],
+                "timestamp": r[4]
+            })
+
+        sims = []
+        for a in range(len(cluster)):
+            for b in range(a + 1, len(cluster)):
+                sims.append(float(sim_matrix[cluster[a], cluster[b]]))
+
+        output["clusters"].append({
+            "cluster_id": ci + 1,
+            "size": len(cluster),
+            "avg_similarity": float(np.mean(sims)) if sims else 0,
+            "entries": entries
+        })
+
+    print(json.dumps(output, indent=2))
+
+
+def _strip_entry_from_file(filepath: Path, title: str, timestamp: str) -> Optional[str]:
+    """Remove a ## entry from a markdown file, return the removed text.
+
+    Matches on the ## [timestamp] Title header. Returns the full entry text
+    (header + body) if found and removed, None otherwise.
+    """
+    if not filepath.exists():
+        return None
+
+    text = filepath.read_text(encoding="utf-8")
+
+    # build the header pattern — escape regex chars in title
+    escaped_title = re.escape(title)
+    # match ## [timestamp] Title through to next ## or EOF
+    pattern = rf'(^## \[{re.escape(timestamp)}\]\s*{escaped_title}\s*\n)(.*?)(?=^## \[|\Z)'
+    match = re.search(pattern, text, re.MULTILINE | re.DOTALL)
+
+    if not match:
+        # try matching just on title (timestamp format may differ slightly)
+        pattern = rf'(^## \[[^\]]*\]\s*{escaped_title}\s*\n)(.*?)(?=^## \[|\Z)'
+        match = re.search(pattern, text, re.MULTILINE | re.DOTALL)
+
+    if not match:
+        return None
+
+    removed = match.group(0)
+    # strip the entry, clean up excess blank lines
+    new_text = text[:match.start()] + text[match.end():]
+    new_text = re.sub(r'\n{3,}', '\n\n', new_text)
+    filepath.write_text(new_text, encoding="utf-8")
+    return removed
+
+
+def cmd_archive(args):
+    """Archive entries: mark in DB, strip from markdown, save to archive file."""
+    if not args:
+        print(f"{C_RED}usage: nix-memory archive <id> [id...]{C_RESET}")
+        return
+
+    db = get_db()
+    ids = [int(a) for a in args if a.isdigit()]
+    if not ids:
+        print(f"{C_RED}no valid IDs provided{C_RESET}")
+        return
+
+    ARCHIVE_DIR.mkdir(exist_ok=True)
+    archive_file = ARCHIVE_DIR / f"archived-{datetime.now().strftime('%Y-%m-%d')}.md"
+
+    archived = []
+    stripped = []
+
+    for entry_id in ids:
+        row = db.execute(
+            "SELECT source_file, title, body, timestamp FROM entries WHERE id = ? AND archived = 0",
+            [entry_id]
+        ).fetchone()
+        if not row:
+            print(f"  {C_OVERLAY}skip {entry_id} (not found or already archived){C_RESET}")
+            continue
+
+        source_file, title, body, timestamp = row
+
+        # mark archived in db
+        db.execute("UPDATE entries SET archived = 1 WHERE id = ?", [entry_id])
+        archived.append((entry_id, title, source_file))
+
+        # strip from source markdown file
+        source_path = MEMORY_DIR / source_file
+        removed_text = _strip_entry_from_file(source_path, title, timestamp)
+
+        if removed_text:
+            stripped.append(entry_id)
+            # append to archive file
+            with open(archive_file, "a", encoding="utf-8") as f:
+                f.write(f"<!-- archived from {source_file}, id={entry_id} -->\n")
+                f.write(removed_text.rstrip() + "\n\n")
+        else:
+            # entry wasn't in the file (already manually removed, or title mismatch)
+            # still archive in DB, just note it
+            with open(archive_file, "a", encoding="utf-8") as f:
+                f.write(f"<!-- archived from {source_file}, id={entry_id} (not found in file) -->\n")
+                f.write(f"## [{timestamp}] {title}\n{body}\n\n")
+
+    db.commit()
+
+    if archived:
+        print(f"  {C_GREEN}archived {len(archived)} entries:{C_RESET}")
+        for eid, title, src in archived:
+            marker = f" {C_PEACH}(stripped){C_RESET}" if eid in stripped else ""
+            print(f"    {C_OVERLAY}#{eid} — {title[:60]}{C_RESET} {C_DIM}{src}{C_RESET}{marker}")
+        if stripped:
+            print(f"  {C_OVERLAY}entries removed from source files, saved to {archive_file.name}{C_RESET}")
+    else:
+        print(f"  {C_OVERLAY}nothing to archive{C_RESET}")
+
+
+def cmd_rebuild(args):
+    """Drop and rebuild the entire index from markdown files."""
+    if DB_PATH.exists():
+        DB_PATH.unlink()
+        print(f"  {C_OVERLAY}dropped old index{C_RESET}")
+    cmd_index(args)
+
+
+def cmd_stats(args):
+    """Quick stats about the memory index."""
+    db = get_db()
+    total = db.execute("SELECT COUNT(*) FROM entries WHERE archived = 0").fetchone()[0]
+    archived = db.execute("SELECT COUNT(*) FROM entries WHERE archived = 1").fetchone()[0]
+
+    print(f"\n  {C_PINK}❯{C_RESET} {C_TEXT}memory stats{C_RESET}\n")
+    print(f"    {C_OVERLAY}active entries:{C_RESET}   {C_MAUVE}{total}{C_RESET}")
+    print(f"    {C_OVERLAY}archived:{C_RESET}         {C_MAUVE}{archived}{C_RESET}")
+    print(f"    {C_OVERLAY}db size:{C_RESET}          {C_MAUVE}{DB_PATH.stat().st_size // 1024}K{C_RESET}")
+
+    by_file = db.execute("""
+        SELECT source_file, COUNT(*) FROM entries WHERE archived = 0 GROUP BY source_file
+    """).fetchall()
+    print(f"    {C_OVERLAY}by file:{C_RESET}")
+    for f, c in by_file:
+        print(f"      {C_TEXT}{f:<20}{C_RESET} {C_MAUVE}{c}{C_RESET}")
+    print()
+
+
+# ── dispatch ─────────────────────────────────────────────────
+
+COMMANDS = {
+    "index": cmd_index,
+    "recall": cmd_recall,
+    "ingest": cmd_ingest,
+    "clusters": cmd_clusters,
+    "curate": cmd_curate,
+    "archive": cmd_archive,
+    "rebuild": cmd_rebuild,
+    "stats": cmd_stats,
+}
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(f"""
+  {C_PINK}❯{C_RESET} {C_TEXT}nix-memory{C_RESET} — semantic memory system
+
+  {C_MAUVE}commands:{C_RESET}
+    index                      rebuild index from markdown files
+    recall [query]             semantic search (or index summary)
+    recall --recent [N]        last N entries by timestamp
+    recall --file <name> [q]   search within one file
+    ingest <text> [--file X]   add entry + embed (default: learnings.md)
+    clusters                   detect similar-memory clusters
+    curate                     output cluster data for synthesis
+    archive <id> [id...]       mark entries as archived post-curation
+    rebuild                    drop + rebuild index from scratch
+    stats                      index statistics
+""")
+        return
+
+    cmd = sys.argv[1]
+    if cmd not in COMMANDS:
+        print(f"{C_RED}unknown command: {cmd}{C_RESET}")
+        print(f"try: {', '.join(COMMANDS.keys())}")
+        sys.exit(1)
+
+    COMMANDS[cmd](sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()

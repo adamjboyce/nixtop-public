@@ -137,6 +137,12 @@ __nix_note() {
     printf '%s❯%s %s → ~%s\n' \
         "$__nix_c_pink" "$__nix_c_reset" "$label" "${target#$HOME}"
 
+    # Background embed into semantic index (non-blocking, fire-and-forget).
+    if [ -x "$HOME/.nix/bin/nix-memory" ]; then
+        setsid "$HOME/.nix/bin/nix-memory" ingest --file "$(basename "$target")" "$body" >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+    fi
+
     # Background git sync so memory lands in the cloud within seconds.
     # setsid + & detaches from the shell's process group so the sync
     # survives the parent shell exiting (matters for yakuake-hooked
@@ -168,6 +174,10 @@ ${__nix_c_pink}❯${__nix_c_reset} nix — shellside handles
   ${__nix_c_muted}nix :snap${__nix_c_reset}              list recent snapshots
   ${__nix_c_muted}nix :snap now [desc]${__nix_c_reset}   take a manual snapshot
   ${__nix_c_muted}nix :note "..."${__nix_c_reset}        append to memory (see :note help)
+  ${__nix_c_muted}nix :recall [query]${__nix_c_reset}    semantic memory search
+  ${__nix_c_muted}nix :recall --recent${__nix_c_reset}   last entries by time
+  ${__nix_c_muted}nix :clusters${__nix_c_reset}          show similar-memory clusters
+  ${__nix_c_muted}nix :curate${__nix_c_reset}            cluster data for synthesis
   ${__nix_c_muted}nix :git${__nix_c_reset}               cloud-synced state (see :git help)
   ${__nix_c_muted}nix :notif [N]${__nix_c_reset}         recent notifications (see :notif help)
   ${__nix_c_muted}nix :help${__nix_c_reset}              this
@@ -243,6 +253,10 @@ nix() {
             git)    "$HOME/.nix/bin/nix-git" "$@" ;;
             notifications|notif)
                     "$HOME/.nix/bin/nix-notifications" "$@" ;;
+            recall) "$HOME/.nix/bin/nix-memory" recall "$@" ;;
+            curate) "$HOME/.nix/bin/nix-memory" curate "$@" ;;
+            clusters) "$HOME/.nix/bin/nix-memory" clusters "$@" ;;
+            memory) "$HOME/.nix/bin/nix-memory" "$@" ;;
             help)   __nix_help        ;;
             *)
                 printf 'nix: unknown subcommand :%s (try :help)\n' "$sub" >&2
