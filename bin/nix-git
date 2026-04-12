@@ -128,11 +128,30 @@ EOF
     cat > "$NIX_ROOT/bootstrap.sh" <<'BOOT'
 #!/usr/bin/env bash
 # Run this once on a fresh machine, after: git clone <url> ~/.nix
-# It places mirrored external files back into their real homes and
+# Places mirrored external files back into their real homes AND
 # wires ~/.bashrc to source ~/.nix/nix-shell.sh if not already.
 set -eu
 NIX_ROOT="$HOME/.nix"
-exec "$NIX_ROOT/bin/nix-git" pull --restore-only
+
+# 1. Lay external files into their real paths
+"$NIX_ROOT/bin/nix-git" pull --restore-only
+
+# 2. Wire shell integration if not already sourced from ~/.bashrc
+BASHRC="$HOME/.bashrc"
+SOURCE_LINE='[ -f "$HOME/.nix/nix-shell.sh" ] && source "$HOME/.nix/nix-shell.sh"'
+if [ -f "$BASHRC" ] && grep -Fq ".nix/nix-shell.sh" "$BASHRC"; then
+    echo "bashrc already wired"
+else
+    printf '\n# nix shellside integration\n%s\n' "$SOURCE_LINE" >> "$BASHRC"
+    echo "wired $BASHRC"
+fi
+
+cat <<'EOF'
+
+❯ nix bootstrap complete.
+  Open a new shell (or source ~/.bashrc) to pick up the integration.
+  Then run: nix :git status
+EOF
 BOOT
     chmod +x "$NIX_ROOT/bootstrap.sh"
 

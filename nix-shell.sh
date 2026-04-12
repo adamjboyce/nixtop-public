@@ -164,6 +164,15 @@ ${__nix_c_pink}❯${__nix_c_reset} nix — shellside handles
 EOF
 }
 
+# Fire a synchronous `nix :git sync` with a tight timeout. Called after
+# claude exits in both the yakuake hook and the manual nix() path so
+# memory updates land in git without the user having to remember.
+__nix_git_autosync() {
+    [ -x "$HOME/.nix/bin/nix-git" ] || return 0
+    [ -d "$HOME/.nix/.git" ] || return 0
+    timeout 15 "$HOME/.nix/bin/nix-git" sync "session end $(date '+%Y-%m-%d %H:%M')" 2>/dev/null || true
+}
+
 # Auto-summon nix when shell parent is yakuake (the quake-style overlay).
 # Guard env var prevents recursion if nix spawns further bash children.
 # If a pending query exists (from KRunner's nix plugin), consume it and
@@ -185,6 +194,7 @@ if [ -z "$__NIX_YAKUAKE_ENTERED" ] && \
         __nix_welcome
         command claude --dangerously-skip-permissions --name nix
     fi
+    __nix_git_autosync
     exit
 fi
 
@@ -209,6 +219,7 @@ nix() {
     if [ $# -eq 0 ]; then
         __nix_welcome
         command claude --dangerously-skip-permissions --name nix
+        __nix_git_autosync
         return
     fi
     if [[ $1 == :* ]]; then
@@ -230,4 +241,5 @@ nix() {
     fi
     __nix_welcome
     command claude --dangerously-skip-permissions --name nix "$@"
+    __nix_git_autosync
 }
