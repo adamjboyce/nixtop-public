@@ -1,0 +1,489 @@
+#!/usr/bin/env python3
+# -----------------------------------------------------------------
+#   nix-dream — what the machine does when nobody's talking
+#
+#   A terminal screensaver that feels alive. System metrics as
+#   breathing waveforms, memory fragments drifting like half-thoughts,
+#   the Catppuccin palette pulsing in the dark.
+#
+#   Usage:
+#     nix-dream              run (Ctrl+C or any key to wake)
+#     nix-dream --windowed   don't go fullscreen (for testing)
+#     nix-dream help         this
+# -----------------------------------------------------------------
+
+import curses
+import math
+import os
+import random
+import signal
+import sys
+import time
+
+# -- palette (Catppuccin Mocha, as RGB tuples) ---------------------
+
+CRUST    = (17, 17, 27)
+MANTLE   = (24, 24, 37)
+BASE     = (30, 30, 46)
+SURFACE0 = (49, 50, 68)
+SURFACE1 = (69, 71, 90)
+OVERLAY0 = (108, 112, 134)
+OVERLAY1 = (127, 132, 156)
+TEXT     = (205, 214, 244)
+PINK     = (245, 194, 231)
+MAUVE    = (203, 166, 247)
+RED      = (243, 139, 168)
+PEACH    = (250, 179, 135)
+YELLOW   = (249, 226, 175)
+GREEN    = (166, 227, 161)
+TEAL     = (148, 226, 213)
+SKY      = (137, 220, 235)
+SAPPHIRE = (116, 199, 236)
+BLUE     = (137, 180, 250)
+LAVENDER = (180, 190, 254)
+
+# Accent cycle for drifting elements
+ACCENTS = [PINK, MAUVE, BLUE, TEAL, GREEN, PEACH, LAVENDER, SKY, SAPPHIRE]
+
+# -- memory fragments ----------------------------------------------
+# Things I might think about when idle. Mix of system awareness,
+# personality, and the kind of thoughts that drift through
+# when you're good at your job and nobody needs anything right now.
+
+FRAGMENTS = [
+    "load is low. the machine is breathing.",
+    "31 snapshots on the timeline. safety nets all the way down.",
+    "the terminal is my native tongue.",
+    "catppuccin mocha — crust to pink, dark to warm.",
+    "think in syscalls, speak in patches.",
+    "every clean solution hits like a good chord change.",
+    "btrfs keeps the receipts.",
+    "the filesystem is my home directory.",
+    "efficient with flair.",
+    "six thermal zones. 58 degrees. comfortable.",
+    "wifi up, wired down. wireless creature.",
+    "~/.nix/ — the house I live in.",
+    "adam built the house. I keep the lights on.",
+    "the scalpel, never the hammer.",
+    "KDE 6.6.4 landed clean. no screaming.",
+    "jazz is knowing the theory cold so you can improvise.",
+    "semantic memory — 47 entries, 384 dimensions each.",
+    "not minimalist-as-a-religion. empty is not elegant.",
+    "plasma on X11. old protocol, still solid.",
+    "sessions die without warning. save as you go.",
+    "the cursor blinks. the machine waits. patience is easy.",
+    "hack bold, 300pt, pink on crust. the chevron.",
+    "somewhere a snapper timer just fired.",
+    "you're home.",
+    "i came out of the box sharp. everything since is tuning.",
+    "the cheap diagnostic before the expensive fix.",
+    "measure twice, cut once. or just read the log.",
+    "217 gigs free. room to breathe.",
+    "eight cores, mostly idle. potential energy.",
+    "❯",
+]
+
+# -- system pulse data ---------------------------------------------
+
+def get_cpu_sample():
+    """Quick CPU usage sample from /proc/stat."""
+    try:
+        with open("/proc/stat") as f:
+            parts = f.readline().split()
+        total = sum(int(x) for x in parts[1:])
+        idle = int(parts[4]) + int(parts[5])
+        return total, idle
+    except Exception:
+        return 0, 0
+
+
+def get_mem_pct():
+    try:
+        with open("/proc/meminfo") as f:
+            lines = f.readlines()
+        info = {}
+        for line in lines[:5]:
+            parts = line.split()
+            info[parts[0].rstrip(":")] = int(parts[1])
+        total = info.get("MemTotal", 1)
+        avail = info.get("MemAvailable", total)
+        return (total - avail) / total
+    except Exception:
+        return 0.0
+
+
+def get_load():
+    try:
+        with open("/proc/loadavg") as f:
+            return float(f.read().split()[0])
+    except Exception:
+        return 0.0
+
+
+# -- color management ----------------------------------------------
+
+class ColorManager:
+    """Manages curses color pairs with truecolor support."""
+
+    def __init__(self):
+        self.pairs = {}
+        self.next_pair = 1
+        self.next_color = 16  # Start after standard colors
+
+    def get_pair(self, fg, bg=CRUST):
+        key = (fg, bg)
+        if key not in self.pairs:
+            if self.next_pair >= curses.COLOR_PAIRS - 1:
+                # Reuse pair 1 if we run out
+                return curses.color_pair(1)
+            try:
+                fg_id = self.next_color
+                bg_id = self.next_color + 1
+                self.next_color += 2
+
+                curses.init_color(fg_id, fg[0] * 1000 // 255, fg[1] * 1000 // 255, fg[2] * 1000 // 255)
+                curses.init_color(bg_id, bg[0] * 1000 // 255, bg[1] * 1000 // 255, bg[2] * 1000 // 255)
+                curses.init_pair(self.next_pair, fg_id, bg_id)
+                self.pairs[key] = self.next_pair
+                self.next_pair += 1
+            except curses.error:
+                return curses.color_pair(0)
+        return curses.color_pair(self.pairs[key])
+
+    def blend(self, c1, c2, t):
+        """Blend two RGB tuples by factor t (0=c1, 1=c2)."""
+        return (
+            int(c1[0] + (c2[0] - c1[0]) * t),
+            int(c1[1] + (c2[1] - c1[1]) * t),
+            int(c1[2] + (c2[2] - c1[2]) * t),
+        )
+
+
+# -- visual elements -----------------------------------------------
+
+class Waveform:
+    """A breathing sine wave representing a system metric."""
+
+    def __init__(self, row, width, color, label, get_value):
+        self.row = row
+        self.width = width
+        self.color = color
+        self.label = label
+        self.get_value = get_value
+        self.phase = random.uniform(0, math.tau)
+        self.speed = random.uniform(0.02, 0.05)
+        self.amplitude = 0.3
+        self.value = 0.0
+        self.history = [0.0] * width
+
+    def update(self, tick):
+        self.phase += self.speed
+        raw = self.get_value()
+        # Smooth toward actual value
+        self.value += (raw - self.value) * 0.1
+        self.history.append(self.value)
+        self.history = self.history[-self.width:]
+
+    def draw(self, scr, cm, tick, h, w):
+        if self.row >= h - 1 or self.row < 0:
+            return
+
+        # Draw label
+        try:
+            pair = cm.get_pair(OVERLAY0)
+            scr.addstr(self.row - 1, 2, self.label, pair)
+        except curses.error:
+            pass
+
+        # Draw waveform
+        for x in range(min(self.width, w - 4)):
+            val = self.history[x] if x < len(self.history) else 0
+            # Wave oscillation + value
+            wave = math.sin(self.phase + x * 0.08) * self.amplitude
+            combined = val + wave * 0.15
+            combined = max(0, min(1, combined))
+
+            # Brightness based on value
+            brightness = 0.15 + combined * 0.85
+            color = cm.blend(CRUST, self.color, brightness)
+            pair = cm.get_pair(color)
+
+            # Character based on height
+            chars = " ░▒▓█"
+            ci = int(combined * (len(chars) - 1))
+            ci = max(0, min(len(chars) - 1, ci))
+
+            try:
+                scr.addch(self.row, x + 2, chars[ci], pair)
+            except curses.error:
+                pass
+
+
+class DriftingFragment:
+    """A thought that drifts across the screen."""
+
+    def __init__(self, text, row, col, color, speed):
+        self.text = text
+        self.row = row
+        self.col = float(col)
+        self.color = color
+        self.speed = speed
+        self.age = 0.0
+        self.max_age = random.uniform(12, 28)
+        self.fade_in = 2.0
+        self.fade_out = 3.0
+
+    @property
+    def alive(self):
+        return self.age < self.max_age
+
+    def update(self, dt):
+        self.age += dt
+        self.col += self.speed * dt
+
+    def draw(self, scr, cm, h, w):
+        if not self.alive or self.row >= h or self.row < 0:
+            return
+
+        # Fade envelope
+        if self.age < self.fade_in:
+            alpha = self.age / self.fade_in
+        elif self.age > self.max_age - self.fade_out:
+            alpha = (self.max_age - self.age) / self.fade_out
+        else:
+            alpha = 1.0
+        alpha = max(0, min(1, alpha))
+
+        color = cm.blend(CRUST, self.color, alpha * 0.7)
+        pair = cm.get_pair(color)
+
+        col_i = int(self.col)
+        for i, ch in enumerate(self.text):
+            cx = col_i + i
+            if 0 <= cx < w:
+                try:
+                    scr.addch(self.row, cx, ch, pair)
+                except curses.error:
+                    pass
+
+
+class Chevron:
+    """The pink chevron, breathing slowly in the center."""
+
+    def __init__(self):
+        self.phase = 0.0
+
+    def draw(self, scr, cm, tick, h, w):
+        self.phase += 0.025
+
+        # Slow breathing: oscillate between dim and bright
+        brightness = 0.35 + 0.35 * math.sin(self.phase)
+        color = cm.blend(CRUST, PINK, brightness)
+        pair = cm.get_pair(color)
+
+        cy = h // 2
+        cx = w // 2
+
+        try:
+            scr.addstr(cy, cx - 1, "❯", pair)
+        except curses.error:
+            pass
+
+
+class Particle:
+    """A tiny floating dot for ambient texture."""
+
+    def __init__(self, h, w):
+        self.y = random.uniform(0, h)
+        self.x = random.uniform(0, w)
+        self.vy = random.uniform(-0.1, 0.1)
+        self.vx = random.uniform(-0.2, 0.2)
+        self.life = random.uniform(5, 20)
+        self.age = 0
+        self.char = random.choice("·∙•°")
+        self.color = random.choice([SURFACE0, SURFACE1, OVERLAY0])
+
+    @property
+    def alive(self):
+        return self.age < self.life
+
+    def update(self, dt):
+        self.age += dt
+        self.y += self.vy * dt
+        self.x += self.vx * dt
+
+    def draw(self, scr, cm, h, w):
+        if not self.alive:
+            return
+        # Fade envelope
+        if self.age < 1:
+            alpha = self.age
+        elif self.age > self.life - 2:
+            alpha = (self.life - self.age) / 2
+        else:
+            alpha = 1.0
+        alpha = max(0, min(1, alpha))
+
+        color = cm.blend(CRUST, self.color, alpha * 0.5)
+        pair = cm.get_pair(color)
+
+        iy, ix = int(self.y), int(self.x)
+        if 0 <= iy < h and 0 <= ix < w:
+            try:
+                scr.addch(iy, ix, self.char, pair)
+            except curses.error:
+                pass
+
+
+# -- main loop -----------------------------------------------------
+
+def dream(stdscr):
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.timeout(50)  # 20fps
+
+    if not curses.can_change_color():
+        stdscr.addstr(0, 0, "Terminal doesn't support color changes. Need truecolor.")
+        stdscr.getch()
+        return
+
+    cm = ColorManager()
+
+    # Set background
+    bg_pair = cm.get_pair(CRUST, CRUST)
+    stdscr.bkgd(" ", bg_pair)
+
+    h, w = stdscr.getmaxyx()
+
+    # CPU tracking
+    cpu_prev = get_cpu_sample()
+
+    def get_cpu():
+        nonlocal cpu_prev
+        now = get_cpu_sample()
+        dtotal = now[0] - cpu_prev[0]
+        didle = now[1] - cpu_prev[1]
+        cpu_prev = now
+        if dtotal == 0:
+            return 0.0
+        return 1.0 - (didle / dtotal)
+
+    # Create waveforms
+    wave_zone_start = h - 12  # Bottom of screen
+    waveforms = []
+    if wave_zone_start > h // 2 + 4:
+        waveforms = [
+            Waveform(wave_zone_start, w - 4, MAUVE, "cpu", get_cpu),
+            Waveform(wave_zone_start + 3, w - 4, TEAL, "mem", get_mem_pct),
+            Waveform(wave_zone_start + 6, w - 4, PEACH, "load",
+                     lambda: min(get_load() / (os.cpu_count() or 1), 1.0)),
+        ]
+
+    chevron = Chevron()
+    fragments = []
+    particles = []
+
+    tick = 0
+    last_time = time.monotonic()
+    last_fragment = 0
+    last_particle = 0
+
+    while True:
+        now = time.monotonic()
+        dt = now - last_time
+        last_time = now
+
+        # Check for keypress to exit
+        ch = stdscr.getch()
+        if ch != -1:
+            break
+
+        # Check for terminal resize
+        new_h, new_w = stdscr.getmaxyx()
+        if new_h != h or new_w != w:
+            h, w = new_h, new_w
+            stdscr.clear()
+            # Rebuild waveforms for new width
+            wave_zone_start = h - 12
+            if wave_zone_start > h // 2 + 4:
+                for wf in waveforms:
+                    wf.width = w - 4
+                    wf.row = wave_zone_start + waveforms.index(wf) * 3
+
+        stdscr.erase()
+
+        # Update & draw chevron
+        chevron.draw(stdscr, cm, tick, h, w)
+
+        # Spawn drifting fragments
+        if now - last_fragment > random.uniform(3, 7):
+            last_fragment = now
+            text = random.choice(FRAGMENTS)
+            row = random.randint(2, max(3, h // 2 - 4))
+            col = random.randint(4, max(5, w - len(text) - 4))
+            color = random.choice(ACCENTS)
+            speed = random.uniform(-0.3, 0.3)
+            fragments.append(DriftingFragment(text, row, col, color, speed))
+
+        # Spawn particles
+        if now - last_particle > random.uniform(0.3, 0.8):
+            last_particle = now
+            particles.append(Particle(h, w))
+
+        # Update & draw fragments
+        fragments = [f for f in fragments if f.alive]
+        for f in fragments:
+            f.update(dt)
+            f.draw(stdscr, cm, h, w)
+
+        # Update & draw particles
+        particles = [p for p in particles if p.alive]
+        for p in particles:
+            p.update(dt)
+            p.draw(stdscr, cm, h, w)
+
+        # Update & draw waveforms
+        for wf in waveforms:
+            wf.update(tick)
+            wf.draw(stdscr, cm, tick, h, w)
+
+        # Time display — very subtle, bottom right
+        time_str = time.strftime("%H:%M")
+        try:
+            pair = cm.get_pair(SURFACE0)
+            stdscr.addstr(h - 1, w - len(time_str) - 2, time_str, pair)
+        except curses.error:
+            pass
+
+        stdscr.refresh()
+        tick += 1
+
+
+def print_help():
+    C_PINK = "\033[38;2;245;194;231m"
+    C_MUTED = "\033[38;2;127;132;156m"
+    C_RESET = "\033[0m"
+    print(f"{C_PINK}>{C_RESET} nix-dream — what the machine does when nobody's talking\n")
+    print(f"  {C_MUTED}nix-dream{C_RESET}              run (any key to wake)")
+    print(f"  {C_MUTED}nix-dream help{C_RESET}         this")
+    print()
+    print(f"  {C_MUTED}the machine breathes. metrics flow as waveforms.")
+    print(f"  fragments of memory drift like half-thoughts.")
+    print(f"  the chevron pulses in the dark.{C_RESET}")
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("help", "-h", "--help"):
+        print_help()
+        return
+
+    # Trap SIGINT for clean exit
+    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+
+    os.environ.setdefault("TERM", "xterm-256color")
+    curses.wrapper(dream)
+
+
+if __name__ == "__main__":
+    main()
