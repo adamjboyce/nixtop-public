@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# nix-voice-display-watch: react to external display connect/disconnect.
+#
+# Tails udev events for the drm subsystem. A change event on a drm device
+# fires once per debounce window (5s) so multi-event hotplug bursts collapse
+# into a single `mm-hm` acknowledgment.
+
+set -euo pipefail
+
+debounce_until=0
+
+exec udevadm monitor --udev --subsystem-match=drm 2>/dev/null \
+| while IFS= read -r line; do
+    if [[ "$line" == *"change"*"drm"* || "$line" == *"add"*"drm"* || "$line" == *"remove"*"drm"* ]]; then
+        now=$(date +%s)
+        if (( now >= debounce_until )); then
+            "$HOME/.nix/bin/nix-voice" mm-hm 2>/dev/null || true
+            debounce_until=$(( now + 5 ))
+        fi
+    fi
+done

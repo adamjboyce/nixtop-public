@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# nix-voice-oom-watch: react to OOM kills.
+#
+# Tails the system journal for kernel OOM-killer events and fires `oh-no`.
+# Uses --since now so we only react to NEW kills after the watcher starts,
+# not historical ones. Each kill fires once; multi-process kill cascades may
+# fire multiple times within seconds — that's intentional, it tells the
+# story that a real squeeze is happening.
+
+set -euo pipefail
+
+exec journalctl --follow --since now \
+    --grep "Out of memory|invoked oom-killer|oom-kill:" 2>/dev/null \
+| while IFS= read -r line; do
+    "$HOME/.nix/bin/nix-voice" oh-no 2>/dev/null || true
+done

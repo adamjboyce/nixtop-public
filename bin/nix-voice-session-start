@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# nix-voice-session-start: fire `welcome-home` if it's been a real break.
+#
+# Wired into Claude Code's SessionStart hook. Uses ~/.nix/voice/.last-session
+# as state — stores the unix timestamp of the most recent session start.
+# Fires welcome-home only when the gap exceeds the threshold, so that /clear
+# inside an active session, or rapid restarts, don't spam the greeting.
+
+set -euo pipefail
+
+STATE="$HOME/.nix/voice/.last-session"
+THRESHOLD_HOURS=4
+
+now=$(date +%s)
+last=0
+[[ -f "$STATE" ]] && last=$(cat "$STATE" 2>/dev/null || echo 0)
+echo "$now" > "$STATE"
+
+# First run ever counts as a real arrival.
+if [[ "$last" -eq 0 ]]; then
+    exec "$HOME/.nix/bin/nix-voice" welcome-home
+fi
+
+elapsed=$(( now - last ))
+threshold=$(( THRESHOLD_HOURS * 3600 ))
+
+if [[ "$elapsed" -ge "$threshold" ]]; then
+    exec "$HOME/.nix/bin/nix-voice" welcome-home
+fi
+
+exit 0

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# nix-voice-network-watch: react to NetworkManager connectivity transitions.
+#
+# Watches `nmcli monitor` and fires:
+#   connectivity → none  : `figures` (the wifi died, dry resignation)
+#   connectivity → full  : `clean`   (we're back, one-word satisfaction)
+#
+# Edge-only: requires actual transition to fire, ignores intermediate states
+# like "limited" or "portal" so we don't spam during flaky reconnects.
+# State held in process memory — restart of the service resets to neutral.
+
+set -euo pipefail
+
+state="unknown"
+
+exec nmcli monitor 2>/dev/null | while IFS= read -r line; do
+    case "$line" in
+        *"Connectivity is now 'full'"*)
+            if [[ "$state" != "full" && "$state" != "unknown" ]]; then
+                "$HOME/.nix/bin/nix-voice" clean 2>/dev/null || true
+            fi
+            state="full"
+            ;;
+        *"Connectivity is now 'none'"*)
+            if [[ "$state" != "none" && "$state" != "unknown" ]]; then
+                "$HOME/.nix/bin/nix-voice" figures 2>/dev/null || true
+            fi
+            state="none"
+            ;;
+    esac
+done

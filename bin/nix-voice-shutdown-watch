@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# nix-voice-shutdown-watch: react to system shutdown/reboot signaling.
+#
+# Subscribes to logind's PrepareForShutdown signal and fires `noted` on the
+# going-down edge (true). We deliberately catch this BEFORE shutdown.target
+# tears down the user session — by the time shutdown.target is reached, the
+# audio daemon is gone and a hook there would be silent.
+#
+# Same dbus monitoring pattern as the sleep watcher.
+
+set -euo pipefail
+
+exec gdbus monitor --system \
+    --dest org.freedesktop.login1 \
+    --object-path /org/freedesktop/login1 2>/dev/null \
+| while IFS= read -r line; do
+    if [[ "$line" == *"PrepareForShutdown"*"(true,)"* ]]; then
+        "$HOME/.nix/bin/nix-voice" noted 2>/dev/null || true
+    fi
+done

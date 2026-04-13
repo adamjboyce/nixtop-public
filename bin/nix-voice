@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# nix-voice: play a phrase from the Nix voice cache.
+#
+# Usage:
+#     nix-voice <key>            # play one phrase by key (e.g. nix-voice your-move)
+#     nix-voice --list           # list all available keys
+#     nix-voice --random <mood>  # random phrase from a mood (kind|sharp|warm)
+#
+# Audio plays asynchronously via paplay so the caller never blocks.
+# Resolves keys against ~/.nix/voice/manifest.json — single source of truth.
+
+set -euo pipefail
+
+VOICE_ROOT="$HOME/.nix/voice"
+MANIFEST="$VOICE_ROOT/manifest.json"
+
+if [[ ! -f "$MANIFEST" ]]; then
+    echo "nix-voice: manifest missing at $MANIFEST" >&2
+    exit 1
+fi
+
+list_keys() {
+    python3 -c "
+import json
+m = json.loads(open('$MANIFEST').read())
+for p in m['phrases']:
+    wav = p.get('wav') or '(no wav)'
+    print(f\"  {p['key']:<14} {p['mood']:<6} {wav}\")
+"
+}
+
+resolve_key() {
+    local key="$1"
+    python3 -c "
+import json, sys
+m = json.loads(open('$MANIFEST').read())
+for p in m['phrases']:
+    if p['key'] == '$key' and p.get('wav'):
+        print(p['wav'])
+        sys.exit(0)
+sys.exit(1)
+"
+}
+
+random_mood() {
+    local mood="$1"
+    python3 -c "
+import json, random, sys
+m = json.loads(open('$MANIFEST').read())
+options = [p['wav'] for p in m['phrases'] if p['mood'] == '$mood' and p.get('wav')]
+if not options:
+    sys.exit(1)
+print(random.choice(options))
+"
+}
+
+case "${1:-}" in
+    --list|-l)
+        list_keys
+        ;;
+    --random|-r)
+        if [[ -z "${2:-}" ]]; then
+            echo "nix-voice --random <mood>" >&2; exit 1
+        fi
+        rel=$(random_mood "$2") || { echo "nix-voice: no phrases for mood '$2'" >&2; exit 1; }
+        paplay "$VOICE_ROOT/$rel" >/dev/null 2>&1 &
+        disown
+        ;;
+    "")
+        echo "usage: nix-voice <key> | --list | --random <mood>" >&2
+        exit 1
+        ;;
+    *)
+        rel=$(resolve_key "$1") || { echo "nix-voice: unknown key '$1'" >&2; exit 1; }
+        paplay "$VOICE_ROOT/$rel" >/dev/null 2>&1 &
+        disown
+        ;;
+esac

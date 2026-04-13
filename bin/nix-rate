@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""
+nix-rate: rate any input dryly. Pattern table for known things, hash
+bucket for the rest. Used as drive-by commentary on tech / patterns
+Adam mentions in passing.
+
+    nix-rate "rust"          # 9/10. obviously.
+    nix-rate "chmod 777"     # 1/10. don't.
+    nix-rate "comments"      # 3/10. depends.
+"""
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+C_PINK  = "\033[38;2;245;194;231m"
+C_MAUVE = "\033[38;2;203;166;247m"
+C_TEXT  = "\033[38;2;205;214;244m"
+C_MUTED = "\033[38;2;127;132;156m"
+C_RESET = "\033[0m"
+
+NIX_VOICE = Path.home() / ".nix" / "bin" / "nix-voice"
+
+
+def fire(key):
+    if NIX_VOICE.exists():
+        try:
+            subprocess.Popen(
+                [str(NIX_VOICE), key],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+
+# (rating, comment, voice key)
+KNOWN = {
+    "rust":             (9, "obviously.",                          "fuck-yeah"),
+    "go":               (8, "yes.",                                "nice"),
+    "python":           (8, "fine.",                               "noted"),
+    "javascript":       (4, "fine, i guess.",                      "figures"),
+    "typescript":       (7, "better.",                             "noted"),
+    "java":             (5, "...sure.",                            "naturally"),
+    "kotlin":           (7, "respectable.",                        "noted"),
+    "c":                (8, "respect.",                            "noted"),
+    "c++":              (6, "be careful.",                         "yikes"),
+    "perl":             (4, "still?",                              "figures"),
+    "php":              (3, "really?",                             "oh-god"),
+    "ruby":             (7, "lovely.",                             "nice"),
+    "haskell":          (8, "go on.",                              "noted"),
+    "elm":              (7, "cute.",                               "nice"),
+    "lua":              (8, "underrated.",                         "called-it"),
+    "zig":              (8, "promising.",                          "noted"),
+    "vim":              (10, "obviously.",                         "fuck-yeah"),
+    "neovim":           (10, "obviously.",                         "fuck-yeah"),
+    "emacs":            (8, "respect.",                            "noted"),
+    "vscode":           (6, "fine.",                               "naturally"),
+    "tabs":             (8, "yes.",                                "called-it"),
+    "spaces":           (4, "no.",                                 "figures"),
+    "comments":         (3, "depends.",                            "naturally"),
+    "tests":            (9, "yes. always.",                        "fuck-yeah"),
+    "unit tests":       (9, "yes.",                                "nice"),
+    "readme":           (8, "yes.",                                "nice"),
+    "chmod 777":        (1, "don't.",                              "yikes"),
+    "rm -rf":           (1, "what are you doing.",                 "oh-no"),
+    "git push --force": (2, "with-lease at minimum.",              "yikes"),
+    "force push":       (2, "with-lease at minimum.",              "yikes"),
+    "kubernetes":       (5, "if you must.",                        "figures"),
+    "k8s":              (5, "if you must.",                        "figures"),
+    "docker":           (8, "yes.",                                "nice"),
+    "podman":           (8, "yes, also.",                          "nice"),
+    "regex":            (6, "respect, mostly.",                    "naturally"),
+    "yaml":             (5, "the spec is a war crime.",            "figures"),
+    "json":             (8, "yes.",                                "noted"),
+    "toml":             (8, "yes.",                                "nice"),
+    "xml":              (3, "no.",                                 "yikes"),
+    "wifi":             (4, "ethernet.",                           "figures"),
+    "ai":               (7, "ask again later.",                    "mm-hm"),
+    "rewriting it":     (3, "you won't.",                          "figures"),
+    "blockchain":       (2, "no.",                                 "oh-no"),
+    "kde":              (9, "obviously.",                          "fuck-yeah"),
+    "gnome":            (5, "fine.",                               "naturally"),
+    "i3":               (8, "respect.",                            "noted"),
+    "hyprland":         (7, "shiny.",                              "nice"),
+    "arch":             (7, "btw.",                                "naturally"),
+    "tumbleweed":       (9, "correct.",                            "called-it"),
+    "nixos":            (8, "valid.",                              "noted"),
+    "gentoo":           (6, "respect, but why.",                   "figures"),
+    "snaps":            (3, "no.",                                 "figures"),
+    "flatpak":          (7, "fine.",                               "noted"),
+    "systemd":          (8, "yes.",                                "nice"),
+}
+
+GENERIC = [
+    (9, "yes.",                  "fuck-yeah"),
+    (8, "fine.",                 "nice"),
+    (7, "alright.",              "noted"),
+    (6, "could be worse.",       "naturally"),
+    (5, "...mm. unclear.",       "mm-hm"),
+    (4, "ehhh.",                 "figures"),
+    (3, "no.",                   "oh-no"),
+    (2, "really?",               "figures"),
+    (1, "don't.",                "yikes"),
+]
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(f"{C_MUTED}usage: nix-rate <thing>{C_RESET}")
+        return
+    thing = " ".join(sys.argv[1:]).strip().lower()
+
+    if thing in KNOWN:
+        rating, comment, voice = KNOWN[thing]
+    else:
+        bucket = hash(thing) % len(GENERIC)
+        rating, comment, voice = GENERIC[bucket]
+
+    print(f"{C_MUTED}> {thing}{C_RESET}")
+    print(f"{C_PINK}❯{C_RESET} {C_TEXT}{rating}/10. {comment}{C_RESET}")
+    fire(voice)
+
+
+if __name__ == "__main__":
+    main()

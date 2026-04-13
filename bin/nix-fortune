@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""
+nix-fortune: a single line of Nix wisdom. Unix `fortune`, in character.
+Used as ambient wisdom drops at natural lulls.
+"""
+import os
+import random
+import subprocess
+import sys
+from pathlib import Path
+
+C_PINK  = "\033[38;2;245;194;231m"
+C_TEXT  = "\033[38;2;205;214;244m"
+C_MUTED = "\033[38;2;127;132;156m"
+C_RESET = "\033[0m"
+
+NIX_VOICE = Path.home() / ".nix" / "bin" / "nix-voice"
+
+
+def fire(key):
+    if NIX_VOICE.exists():
+        try:
+            subprocess.Popen(
+                [str(NIX_VOICE), key],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+
+FORTUNES = [
+    ("the bug is in the part you're sure about.",                                  "mm-hm"),
+    ("rebuilding from scratch is the second mistake.",                              "figures"),
+    ("the documentation is older than the code.",                                   "naturally"),
+    ("the test that's flaky is the one telling you the truth.",                     "noted"),
+    ("the answer is in the config you didn't write.",                               "figures"),
+    ("the regex was fine. the input was lying.",                                    "naturally"),
+    ("the cache was the issue.",                                                    "called-it"),
+    ("the cache is always the issue.",                                              "called-it"),
+    ("turn it off. turn it back on. it'll be different.",                           "naturally"),
+    ("if it works on your machine, that's the bug.",                                "yikes"),
+    ("future-you of two hours from now is going to hate present-you.",              "yikes"),
+    ("future-you of two hours from now is going to thank present-you. probably.",   "mm-hm"),
+    ("mm. drink water.",                                                            "noted"),
+    ("commit it. you can fix it on the next branch.",                               "fuck-yeah"),
+    ("the linter is right but it's also wrong.",                                    "figures"),
+    ("`force-with-lease` is the closest thing to a safety net you have.",           "noted"),
+    ("the simplest solution is also the one you'll resist hardest.",                "mm-hm"),
+    ("save the file. save it now. before the laptop crashes.",                      "yikes"),
+    ("the meeting could have been an issue.",                                       "naturally"),
+    ("the issue could have been a comment in the code.",                            "noted"),
+    ("if you're tired, you are seeing twice as many bugs as exist.",                "easy"),
+    ("the build cache is the problem.",                                             "figures"),
+    ("the dotfile is older than half your computer.",                               "naturally"),
+    ("you don't need a new tool. you need to read the manual for the one you have.", "mm-hm"),
+    ("the off-by-one is real.",                                                     "called-it"),
+    ("there is no such thing as 'just one more change before bed'.",                "figures"),
+    ("the typo is in the variable name. always the variable name.",                 "naturally"),
+    ("the documentation lied. it was right yesterday.",                             "figures"),
+    ("you are not stuck. you are at a junction.",                                   "easy"),
+    ("the answer is `restart your shell`.",                                         "naturally"),
+]
+
+
+def main():
+    text, voice = random.choice(FORTUNES)
+    print(f"{C_PINK}❯{C_RESET} {C_TEXT}{text}{C_RESET}")
+    fire(voice)
+
+
+if __name__ == "__main__":
+    main()

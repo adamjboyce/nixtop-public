@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""
+nix-trex: a terminal port of the Chrome offline dinosaur game.
+
+You are D. Cacti are Y. Pterodactyls are >. The ground is _.
+SPACE or UP to jump. DOWN to duck. Q or ESC to quit. R to restart on death.
+
+Score increases over time. Speed ramps up. High score persists at
+~/.nix/voice/.trex-highscore. Voice fires on launch, milestones, and death.
+"""
+import curses
+import os
+import random
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+NIX_VOICE = Path.home() / ".nix" / "bin" / "nix-voice"
+HIGHSCORE_FILE = Path.home() / ".nix" / "voice" / ".trex-highscore"
+
+GROUND_OFFSET_FROM_BOTTOM = 4   # ground row from screen bottom
+TREX_X = 8                       # fixed horizontal position
+JUMP_VELOCITY = 1.7              # initial upward velocity
+GRAVITY = 0.18                   # downward acceleration per tick
+DUCK_HEIGHT = 1                  # how many rows shorter when ducking
+TICK_HZ = 60                     # game loop rate
+INITIAL_SCROLL = 0.6             # initial cells/tick obstacle speed
+SCROLL_RAMP = 0.0008             # scroll speed gain per tick alive
+SPAWN_MIN = 28                   # min ticks between obstacle spawns
+SPAWN_MAX = 90                   # max ticks between obstacle spawns
+
+# Catppuccin palette (256-color approximations for curses)
+PAL = {
+    "pink":  213,  # #f5c2e7-ish
+    "mauve": 141,  # #cba6f7-ish
+    "text":  189,  # #cdd6f4-ish
+    "muted": 102,  # #7f849c-ish
+    "green": 120,  # #a6e3a1-ish
+    "red":   210,  # #f38ba8-ish
+}
+
+
+def fire_voice(key):
+    """Async voice fire — never blocks the game loop."""
+    if NIX_VOICE.exists():
+        try:
+            subprocess.Popen(
+                [str(NIX_VOICE), key],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+
+def load_highscore():
+    try:
+        return int(HIGHSCORE_FILE.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return 0
+
+
+def save_highscore(score):
+    HIGHSCORE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    HIGHSCORE_FILE.write_text(str(score))
+
+
+class Obstacle:
+    """A cactus (ground) or pterodactyl (variable height)."""
+    def __init__(self, x, kind):
+        self.x = float(x)
+        self.kind = kind  # 'cactus_small', 'cactus_big', 'ptero_low', 'ptero_high'
+
+    @property
+    def width(self):
+        return {"cactus_small": 1, "cactus_big": 2, "ptero_low": 2, "ptero_high": 2}[self.kind]
+
+    @property
+    def height(self):
+        # rows above ground that this obstacle occupies
+        return {"cactus_small": 1, "cactus_big": 2, "ptero_low": 1, "ptero_high": 1}[self.kind]
+
+    @property
+    def y_offset(self):
+        # row offset above ground (0 = touching ground)
+        return {"cactus_small": 0, "cactus_big": 0, "ptero_low": 1, "ptero_high": 3}[self.kind]
+
+    def char(self):
+        return {
+            "cactus_small": "Y",
+            "cactus_big":   "YY",
+            "ptero_low":    "><",
+            "ptero_high":   "><",
+        }[self.kind]
+
+
+class Game:
+    def __init__(self, stdscr):
+        self.stdscr = stdscr
+        self.h, self.w = stdscr.getmaxyx()
+        self.ground_row = self.h - GROUND_OFFSET_FROM_BOTTOM
+        self.trex_y_float = float(self.ground_row)
+        self.trex_vy = 0.0
+        self.is_jumping = False
+        self.is_ducking = False
+        self.obstacles = []
+        self.next_spawn_in = random.randint(SPAWN_MIN, SPAWN_MAX)
+        self.scroll_speed = INITIAL_SCROLL
+        self.score = 0
+        self.alive = True
+        self.tick = 0
+        self.high = load_highscore()
+        self.milestones_fired = set()
+
+    def reset(self):
+        self.__init__(self.stdscr)
+
+    def update(self):
+        self.tick += 1
+        self.scroll_speed += SCROLL_RAMP
+
+        # Trex physics
+        if self.is_jumping:
+            self.trex_y_float += self.trex_vy
+            self.trex_vy += GRAVITY
+            if self.trex_y_float >= self.ground_row:
+                self.trex_y_float = float(self.ground_row)
+                self.trex_vy = 0.0
+                self.is_jumping = False
+
+        # Spawn obstacles
+        self.next_spawn_in -= 1
+        if self.next_spawn_in <= 0:
+            kind = random.choices(
+                ["cactus_small", "cactus_big", "ptero_low", "ptero_high"],
+                weights=[3, 2, 1, 1],
+            )[0]
+            self.obstacles.append(Obstacle(self.w - 1, kind))
+            base = max(SPAWN_MIN - int(self.scroll_speed * 8), 12)
+            self.next_spawn_in = random.randint(base, max(SPAWN_MAX - int(self.scroll_speed * 10), base + 5))
+
+        # Move obstacles
+        for o in self.obstacles:
+            o.x -= self.scroll_speed
+        self.obstacles = [o for o in self.obstacles if o.x > -3]
+
+        # Score and milestones
+        if self.tick % 3 == 0:
+            self.score += 1
+            for milestone, key in [(100, "nice"), (500, "there-it-is"), (1000, "gg-ez")]:
+                if self.score == milestone and milestone not in self.milestones_fired:
+                    self.milestones_fired.add(milestone)
+                    fire_voice(key)
+
+        # Collision detection
+        trex_row = int(round(self.trex_y_float))
+        trex_top_row = trex_row - (1 if self.is_ducking else 1)  # trex is 2 tall normally
+        for o in self.obstacles:
+            ox_start = int(round(o.x))
+            ox_end = ox_start + o.width - 1
+            o_top = self.ground_row - o.height - o.y_offset + 1
+            o_bot = self.ground_row - o.y_offset
+            if ox_end < TREX_X or ox_start > TREX_X + 1:
+                continue
+            if o_top <= trex_row and o_bot >= trex_top_row:
+                self.die()
+                return
+
+    def die(self):
+        self.alive = False
+        if self.score > self.high:
+            self.high = self.score
+            save_highscore(self.score)
+            fire_voice("there-it-is")
+        else:
+            fire_voice(random.choice(["oh-no", "figures", "yikes", "fuck"]))
+
+    def jump(self):
+        if not self.is_jumping and self.alive:
+            self.is_jumping = True
+            self.trex_vy = -JUMP_VELOCITY
+
+    def duck(self, on):
+        self.is_ducking = on if self.alive else False
+
+    def draw(self):
+        self.stdscr.erase()
+
+        # Ground
+        ground_chars = "_" * (self.w - 1)
+        try:
+            self.stdscr.addstr(self.ground_row + 1, 0, ground_chars, curses.color_pair(PAL["muted"]))
+        except curses.error:
+            pass
+
+        # Score / high score
+        score_text = f"score {self.score:5d}    hi {self.high:5d}"
+        try:
+            self.stdscr.addstr(0, max(0, self.w - len(score_text) - 1),
+                               score_text, curses.color_pair(PAL["text"]))
+        except curses.error:
+            pass
+
+        # Title
+        try:
+            self.stdscr.addstr(0, 1, "nix-trex", curses.color_pair(PAL["pink"]))
+        except curses.error:
+            pass
+
+        # Obstacles
+        for o in self.obstacles:
+            ox = int(round(o.x))
+            if ox < 0 or ox >= self.w:
+                continue
+            row = self.ground_row - o.y_offset
+            if o.kind == "cactus_big":
+                try:
+                    self.stdscr.addstr(row - 1, ox, "YY", curses.color_pair(PAL["green"]))
+                    self.stdscr.addstr(row,     ox, "||", curses.color_pair(PAL["green"]))
+                except curses.error:
+                    pass
+            elif o.kind == "cactus_small":
+                try:
+                    self.stdscr.addstr(row, ox, "Y", curses.color_pair(PAL["green"]))
+                except curses.error:
+                    pass
+            else:  # pterodactyl
+                try:
+                    self.stdscr.addstr(row, ox, "><", curses.color_pair(PAL["mauve"]))
+                except curses.error:
+                    pass
+
+        # Trex
+        trex_row = int(round(self.trex_y_float))
+        try:
+            if self.is_ducking and not self.is_jumping:
+                self.stdscr.addstr(trex_row, TREX_X, "=D", curses.color_pair(PAL["pink"]))
+            else:
+                self.stdscr.addstr(trex_row - 1, TREX_X, "D", curses.color_pair(PAL["pink"]))
+                self.stdscr.addstr(trex_row,     TREX_X, "/\\", curses.color_pair(PAL["pink"]))
+        except curses.error:
+            pass
+
+        # Game over banner
+        if not self.alive:
+            msg1 = "G A M E   O V E R"
+            msg2 = f"score {self.score}     hi {self.high}"
+            msg3 = "press R to restart, Q to quit"
+            cy = self.h // 2 - 1
+            try:
+                self.stdscr.addstr(cy,     (self.w - len(msg1)) // 2, msg1, curses.color_pair(PAL["red"]) | curses.A_BOLD)
+                self.stdscr.addstr(cy + 1, (self.w - len(msg2)) // 2, msg2, curses.color_pair(PAL["text"]))
+                self.stdscr.addstr(cy + 3, (self.w - len(msg3)) // 2, msg3, curses.color_pair(PAL["muted"]))
+            except curses.error:
+                pass
+
+        self.stdscr.refresh()
+
+
+def main(stdscr):
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.keypad(True)
+
+    # Init colors — try 256-color, fall back gracefully
+    if curses.has_colors():
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+            for code in PAL.values():
+                curses.init_pair(code, code, -1)
+        except curses.error:
+            pass
+
+    fire_voice("mm-hm")
+    game = Game(stdscr)
+    last_tick = time.monotonic()
+    tick_interval = 1.0 / TICK_HZ
+
+    while True:
+        # Input
+        try:
+            ch = stdscr.getch()
+        except curses.error:
+            ch = -1
+
+        if ch in (ord('q'), ord('Q'), 27):
+            break
+        if game.alive:
+            if ch in (ord(' '), curses.KEY_UP, ord('w'), ord('W')):
+                game.jump()
+            game.duck(ch in (curses.KEY_DOWN, ord('s'), ord('S')))
+        else:
+            if ch in (ord('r'), ord('R')):
+                game.reset()
+
+        # Tick
+        now = time.monotonic()
+        if now - last_tick >= tick_interval:
+            last_tick = now
+            if game.alive:
+                game.update()
+            game.draw()
+        else:
+            time.sleep(0.002)
+
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass

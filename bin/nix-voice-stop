@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# nix-voice-stop: time-aware Stop hook firing.
+#
+# Default: `your-move` — the everyday turn-end handoff.
+# 1am-4am window: fire `figures` ONCE per calendar night (the dry "you're up
+# late again" beat), then revert to `your-move` for the rest of that session.
+# State tracked in ~/.nix/voice/.last-late-night.
+
+set -euo pipefail
+
+hour=$(date +%H)
+state="$HOME/.nix/voice/.last-late-night"
+
+# 10# forces base-10 — protects against 08/09 being read as invalid octal.
+if (( 10#$hour >= 1 && 10#$hour <= 4 )); then
+    today=$(date +%Y-%m-%d)
+    last=""
+    [[ -f "$state" ]] && last=$(cat "$state" 2>/dev/null || true)
+    if [[ "$last" != "$today" ]]; then
+        echo "$today" > "$state"
+        exec "$HOME/.nix/bin/nix-voice" figures
+    fi
+fi
+
+exec "$HOME/.nix/bin/nix-voice" your-move

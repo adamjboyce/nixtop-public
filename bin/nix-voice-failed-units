@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# nix-voice-failed-units: fire `yikes` if the count of failed systemd units
+# increases since the last check. Run via a user timer every few minutes.
+#
+# Logic: only fire on INCREASE — persistent failures don't re-spam, recoveries
+# silently update the baseline. First-ever run never fires (no baseline).
+
+set -euo pipefail
+
+STATE="$HOME/.nix/voice/.failed-units-count"
+current=$(systemctl --failed --no-legend 2>/dev/null | wc -l)
+
+if [[ ! -f "$STATE" ]]; then
+    echo "$current" > "$STATE"
+    exit 0
+fi
+
+last=$(cat "$STATE")
+echo "$current" > "$STATE"
+
+if (( current > last )); then
+    "$HOME/.nix/bin/nix-voice" yikes
+fi

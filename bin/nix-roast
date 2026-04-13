@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""
+nix-roast: pulls real Adam state and generates contextually accurate roast.
+
+Sources of truth:
+  - git log: most-touched files in recent commits
+  - system uptime / load5
+  - current directory
+  - file mtimes in cwd (recent activity bursts)
+  - hour of day (catches late-night sessions)
+
+Used unprompted by Nix when she needs to knock Adam down a peg —
+gentle, affectionate, never mean. Picks up to 3 observations and
+fires the voice from the last one's tone.
+"""
+import os
+import random
+import subprocess
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+
+C_PINK  = "\033[38;2;245;194;231m"
+C_MAUVE = "\033[38;2;203;166;247m"
+C_TEXT  = "\033[38;2;205;214;244m"
+C_MUTED = "\033[38;2;127;132;156m"
+C_RESET = "\033[0m"
+
+NIX_VOICE = Path.home() / ".nix" / "bin" / "nix-voice"
+
+
+def fire(key):
+    if NIX_VOICE.exists():
+        try:
+            subprocess.Popen(
+                [str(NIX_VOICE), key],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+
+def get(cmd):
+    try:
+        return subprocess.check_output(
+            cmd, stderr=subprocess.DEVNULL, text=True, timeout=2,
+        ).strip()
+    except Exception:
+        return ""
+
+
+def uptime_hours():
+    try:
+        with open("/proc/uptime") as f:
+            return int(float(f.read().split()[0]) / 3600)
+    except Exception:
+        return None
+
+
+def load5():
+    try:
+        with open("/proc/loadavg") as f:
+            return float(f.read().split()[1])
+    except Exception:
+        return None
+
+
+def in_git_repo():
+    return bool(get(["git", "rev-parse", "--git-dir"]))
+
+
+def recent_touched_files():
+    """Files touched across last 5 commits in current repo."""
+    if not in_git_repo():
+        return []
+    log = get(["git", "log", "--pretty=format:", "--name-only", "-5"])
+    return [l for l in log.splitlines() if l.strip()]
+
+
+def make_observations():
+    """Return a list of (text, voice_key) tuples — possible roast lines."""
+    obs = []
+
+    # Time of day
+    h = time.localtime().tm_hour
+    if h < 5:
+        obs.append((f"it's {h:02d}:00. you're up. mm.", "figures"))
+    elif h >= 23:
+        obs.append((f"it's {h:02d}:00. one more thing, was it?", "naturally"))
+    elif 14 <= h < 17:
+        obs.append(("mid-afternoon. the slump is real.", "mm-hm"))
+
+    # Uptime
+    up = uptime_hours()
+    if up is not None:
+        if up >= 168:  # week
+            obs.append((f"the box has been up {up} hours. when did you last reboot, exactly.", "yikes"))
+        elif up >= 48:
+            obs.append((f"uptime: {up} hours. you don't shut down anymore, do you.", "figures"))
+
+    # Load
+    la = load5()
+    if la is not None:
+        if la > 4.0:
+            obs.append((f"load5 is {la:.2f}. the box is dying. easy.", "easy"))
+        elif la > 2.0:
+            obs.append((f"load5 is {la:.2f}. somebody's working.", "noted"))
+
+    # Recent commits in cwd repo
+    files = recent_touched_files()
+    if files:
+        c = Counter(files)
+        top, count = c.most_common(1)[0]
+        if count >= 3:
+            short = top if len(top) < 30 else "..." + top[-27:]
+            obs.append((f"your last 5 commits all touched `{short}`. naturally.", "naturally"))
+        elif len(set(files)) == 1:
+            obs.append((f"every recent commit was the same file. mm.", "mm-hm"))
+
+    # CWD
+    cwd = Path.cwd()
+    home = Path.home()
+    if str(cwd).startswith(str(home / ".nix")):
+        obs.append(("you're in `~/.nix` again. of course you are.", "called-it"))
+    elif str(cwd).startswith(str(home / "Downloads")):
+        obs.append(("you're working out of `~/Downloads`. yikes.", "yikes"))
+
+    # File burst in cwd
+    try:
+        now = time.time()
+        recent = [
+            p for p in cwd.iterdir()
+            if p.is_file() and not p.name.startswith(".") and now - p.stat().st_mtime < 3600
+        ]
+        if len(recent) >= 6:
+            obs.append((f"{len(recent)} files touched in `{cwd.name}` in the last hour. you're going.", "fuck-yeah"))
+    except Exception:
+        pass
+
+    if not obs:
+        obs.append((random.choice([
+            "couldn't find anything to roast. that's almost suspicious.",
+            "the box is clean. the code is clean. you're suspicious.",
+            "no roast material. take the win.",
+        ]), "naturally"))
+
+    return obs
+
+
+def main():
+    obs = make_observations()
+    random.shuffle(obs)
+    obs = obs[:3]
+
+    print(f"{C_MUTED}> nix-roast{C_RESET}")
+    for text, _ in obs:
+        print(f"{C_PINK}❯{C_RESET} {C_TEXT}{text}{C_RESET}")
+    fire(obs[-1][1])
+
+
+if __name__ == "__main__":
+    main()

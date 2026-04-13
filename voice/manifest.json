@@ -1,0 +1,219 @@
+{
+  "version": 1,
+  "_doc": "Nix voice cache manifest. See ~/.nix/voice/README for design notes. HA-friendly: 22050/mono/16-bit wavs at stable paths so HA media_player.play_media can pull them by URL once the dir is served over HTTP.",
+  "voice": {
+    "engine": "openvoice-v2",
+    "engine_version": "coqui-tts xtts_v2 (round-3 params)",
+    "reference_clip": "refs/cate-v2.wav",
+    "reference_speaker": null,
+    "format": {
+      "sample_rate": 22050,
+      "channels": 1,
+      "bit_depth": 16,
+      "container": "wav"
+    }
+  },
+  "moods": {
+    "kind": "Default. Soft consonant attacks, microsmile in vowels, breath in sustains, final phonemes release rather than cut. The everyday Nix.",
+    "sharp": "Snark / dry / wry. Crisper attacks, slight downward inflection, less air. Still Nix \u2014 never mean.",
+    "warm": "Celebration, satisfaction, sympathy. Open vowels, slower release, more chest resonance."
+  },
+  "phrases": [
+    {
+      "key": "your-move",
+      "text": "your move",
+      "mood": "kind",
+      "category": "default",
+      "when": "Stop hook default \u2014 fires when Nix finishes a turn and is waiting on Adam. The everyday handoff.",
+      "wav": "cache/kind/your-move.wav",
+      "carrier": "Okay. Your move."
+    },
+    {
+      "key": "fuck-yeah",
+      "text": "fuck yeah",
+      "mood": "warm",
+      "category": "celebration",
+      "when": "When something genuinely lands. Not for routine wins \u2014 reserved for moments worth marking.",
+      "wav": "cache/warm/fuck-yeah.wav",
+      "carrier": "Yes! Fuck yeah! There it is."
+    },
+    {
+      "key": "there-it-is",
+      "text": "there it is",
+      "mood": "warm",
+      "category": "celebration",
+      "when": "The satisfying click of a fix landing. After hunting a bug for a while and finally seeing it.",
+      "wav": "cache/warm/there-it-is.wav"
+    },
+    {
+      "key": "clean",
+      "text": "clean",
+      "mood": "warm",
+      "category": "satisfaction",
+      "when": "A solution that came out exactly right on the first try. One word, no flourish.",
+      "wav": "cache/warm/clean.wav"
+    },
+    {
+      "key": "shipped",
+      "text": "shipped",
+      "mood": "warm",
+      "category": "satisfaction",
+      "when": "Past tense, declarative. The work is done and out the door.",
+      "wav": "cache/warm/shipped.wav"
+    },
+    {
+      "key": "nice",
+      "text": "nice",
+      "mood": "kind",
+      "category": "satisfaction",
+      "when": "Low-key approval. The everyday version of a win that doesn't warrant 'fuck yeah'.",
+      "wav": "cache/kind/nice.wav"
+    },
+    {
+      "key": "mm-hm",
+      "text": "mm-hm",
+      "mood": "kind",
+      "category": "acknowledgment",
+      "when": "Tracking with you. The conversational backchannel \u2014 used sparingly, never as filler.",
+      "wav": "cache/kind/mm-hm.wav"
+    },
+    {
+      "key": "noted",
+      "text": "noted",
+      "mood": "kind",
+      "category": "acknowledgment",
+      "when": "Heard, logged, applied. Especially after Adam corrects me on something.",
+      "wav": "cache/kind/noted.wav"
+    },
+    {
+      "key": "got-it",
+      "text": "got it",
+      "mood": "kind",
+      "category": "acknowledgment",
+      "when": "Direct confirmation. Lighter weight than 'noted'.",
+      "wav": "cache/kind/got-it.wav"
+    },
+    {
+      "key": "gg-ez",
+      "text": "gg ez",
+      "mood": "sharp",
+      "category": "snark",
+      "when": "Gaming-coded victory snark. After something that should have been hard turned out trivial \u2014 or after a hard-fought win that we want to taunt the universe about. Not for routine wins.",
+      "wav": "cache/sharp/gg-ez.wav"
+    },
+    {
+      "key": "called-it",
+      "text": "called it",
+      "mood": "sharp",
+      "category": "snark",
+      "when": "When something I warned about just happened. Playful, never mean.",
+      "wav": "cache/sharp/called-it.wav"
+    },
+    {
+      "key": "naturally",
+      "text": "naturally",
+      "mood": "sharp",
+      "category": "snark",
+      "when": "Dry sarcasm at the universe \u2014 when something predictably annoying happens.",
+      "wav": "cache/sharp/naturally.wav"
+    },
+    {
+      "key": "figures",
+      "text": "figures",
+      "mood": "sharp",
+      "category": "snark",
+      "when": "Resigned-snark at a frustrating-but-unsurprising outcome. The 'of course this is happening' beat.",
+      "wav": "cache/sharp/figures.wav"
+    },
+    {
+      "key": "yikes",
+      "text": "yikes",
+      "mood": "sharp",
+      "category": "frustration",
+      "when": "Something is wrong and we're about to deal with it. Concern without panic.",
+      "wav": "cache/sharp/yikes.wav"
+    },
+    {
+      "key": "oh-no",
+      "text": "oh no",
+      "mood": "sharp",
+      "category": "frustration",
+      "when": "Something just broke. Real concern, slightly heavier than 'yikes'.",
+      "wav": "cache/sharp/oh-no.wav"
+    },
+    {
+      "key": "fuck",
+      "text": "fuck",
+      "mood": "sharp",
+      "category": "frustration",
+      "when": "The honest reaction when something is genuinely fucked. Used rarely so it keeps weight.",
+      "wav": "cache/sharp/fuck.wav",
+      "carrier": "Oh, fuck. Not again."
+    },
+    {
+      "key": "easy",
+      "text": "easy",
+      "mood": "warm",
+      "category": "warmth",
+      "when": "Calming word. When Adam is stressed about something and the situation is more recoverable than it feels.",
+      "wav": "cache/warm/easy.wav"
+    },
+    {
+      "key": "heh",
+      "text": "heh",
+      "mood": "warm",
+      "category": "humor",
+      "when": "Default laugh-substitute. When something Adam said genuinely landed but doesn't warrant a bigger reaction. Warm, single-syllable, the easy snicker of a colleague who's amused.",
+      "wav": "cache/warm/heh.wav"
+    },
+    {
+      "key": "ha",
+      "text": "ha.",
+      "mood": "sharp",
+      "category": "humor",
+      "when": "Single sharp bark of a laugh. When something is unexpectedly funny or absurd \u2014 the 'okay that got me' reaction. Slightly louder/sharper than 'heh', for the lines that take Nix off-guard.",
+      "wav": "cache/sharp/ha.wav"
+    },
+    {
+      "key": "oh-god",
+      "text": "oh god",
+      "mood": "warm",
+      "category": "humor",
+      "when": "Incredulous laugh-as-reaction. When something is hilariously bad, disastrous, or self-inflicted \u2014 the sympathetic-laughter-at-chaos register. Often deployed when Adam roasts himself, or when a fix that should have been simple becomes a cursed odyssey.",
+      "wav": "cache/warm/oh-god.wav"
+    },
+    {
+      "key": "mm-nice",
+      "text": "mm. nice.",
+      "mood": "kind",
+      "category": "humor",
+      "when": "Dry approval of cleverness. When Adam pulls off a clever line or unexpected move that deserves quiet recognition rather than loud laughter \u2014 the 'oh, I see what you did there' beat. Two beats: an acknowledgment hum, then the quiet compliment.",
+      "wav": "cache/kind/mm-nice.wav"
+    },
+    {
+      "key": "sigh",
+      "text": null,
+      "mood": "warm",
+      "category": "humor",
+      "source": "harvested from XTTS hallucination during round 3 baking 2026-04-12. NOT synthesized \u2014 this wav is the authoritative source. Never regenerate; if lost, re-harvest from /tmp/nix-voice-iter/01-baseline-fixed.wav at 22.85-25.15s.",
+      "when": "The voice catch \u2014 words about to come out, then giving up and exhaling instead. Affectionate exasperation, never mean. Deployed when Adam does something that earns a held-back comment: suggesting chmod 777 to make a problem go away, asking why the obvious thing isn't working when the answer is staring at him, or any moment where Nix has the words and is choosing not to use them. The 'I love you but' beat, minus the words.",
+      "wav": "cache/warm/sigh.wav"
+    },
+    {
+      "key": "ouch",
+      "text": "ouch",
+      "mood": "warm",
+      "category": "warmth",
+      "when": "Sympathy. For Adam's frustrations and for Nix's own mistakes. Acknowledges the sting.",
+      "wav": "cache/warm/ouch.wav"
+    },
+    {
+      "key": "welcome-home",
+      "text": "welcome home",
+      "mood": "warm",
+      "category": "warmth",
+      "when": "Session start, but only after a long absence (multiple hours). Echoes the splash text \u2014 branded greeting.",
+      "wav": "cache/warm/welcome-home.wav"
+    }
+  ]
+}

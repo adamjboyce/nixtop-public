@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# nix-voice-sleep-watch: fire `welcome-home` when the system resumes from
+# suspend or hibernate. Subscribes to logind's PrepareForSleep signal via
+# gdbus and reacts only to the resume edge (false), not the going-to-sleep
+# edge (true).
+#
+# Run as a user systemd service tied to graphical-session.target so it has
+# session dbus access and audio routing.
+
+set -euo pipefail
+
+exec gdbus monitor --system \
+    --dest org.freedesktop.login1 \
+    --object-path /org/freedesktop/login1 2>/dev/null \
+| while IFS= read -r line; do
+    if [[ "$line" == *"PrepareForSleep"*"(false,)"* ]]; then
+        "$HOME/.nix/bin/nix-voice" welcome-home
+    fi
+done

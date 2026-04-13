@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Global git post-commit hook: fire a voice phrase after a real commit.
+#
+# Wired via `git config --global core.hooksPath ~/.nix/git-hooks`.
+#
+# Phrase logic:
+#   - first commit of a calendar day → `there-it-is` (the day's first ship)
+#   - any subsequent commit          → `shipped`
+#
+# Suppressed during multi-commit operations (rebase / cherry-pick / merge) so
+# the voice marks intent, not churn.
+
+set -euo pipefail
+
+gitdir=$(git rev-parse --git-dir 2>/dev/null) || exit 0
+
+if [[ -d "$gitdir/rebase-merge" \
+   || -d "$gitdir/rebase-apply" \
+   || -f "$gitdir/CHERRY_PICK_HEAD" \
+   || -f "$gitdir/MERGE_HEAD" ]]; then
+    exit 0
+fi
+
+STATE="$HOME/.nix/voice/.last-commit-day"
+today=$(date +%Y-%m-%d)
+last=""
+[[ -f "$STATE" ]] && last=$(cat "$STATE" 2>/dev/null || true)
+echo "$today" > "$STATE"
+
+if [[ "$last" != "$today" ]]; then
+    "$HOME/.nix/bin/nix-voice" there-it-is 2>/dev/null || true
+else
+    "$HOME/.nix/bin/nix-voice" shipped 2>/dev/null || true
+fi

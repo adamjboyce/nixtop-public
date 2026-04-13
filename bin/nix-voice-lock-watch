@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# nix-voice-lock-watch: react to screen lock / unlock.
+#
+# Subscribes to the freedesktop ScreenSaver dbus interface (KDE implements
+# this) and fires:
+#   ActiveChanged → true   : `noted`  (Adam stepped away from the keyboard)
+#   ActiveChanged → false  : `mm-hm`  (Adam came back to the keyboard)
+#
+# Distinct from the suspend/resume sleep watcher: locking is a softer
+# transition, often when stepping out for coffee. The voice should match.
+
+set -euo pipefail
+
+exec gdbus monitor --session \
+    --dest org.freedesktop.ScreenSaver \
+    --object-path /ScreenSaver 2>/dev/null \
+| while IFS= read -r line; do
+    if [[ "$line" == *"ActiveChanged"*"(true,)"* ]]; then
+        "$HOME/.nix/bin/nix-voice" noted 2>/dev/null || true
+    elif [[ "$line" == *"ActiveChanged"*"(false,)"* ]]; then
+        "$HOME/.nix/bin/nix-voice" mm-hm 2>/dev/null || true
+    fi
+done

@@ -516,6 +516,135 @@ class Chevron:
             pass
 
 
+class Bosun:
+    """Bosun the pet, frolicking across the dream.
+
+    Reads mood from ~/.nix/voice/.pet-state every few seconds. Random-walks
+    around the screen with speed and bounciness scaled to mood. Leaves a
+    fading trail of footprints. When dead, sits motionless as a muted ✕.
+    """
+
+    STATE_PATH = os.path.expanduser("~/.nix/voice/.pet-state")
+    MOOD_REFRESH = 8.0  # seconds between state file reads
+
+    def __init__(self, h, w):
+        self.x = w / 2.0
+        self.y = h / 2.0
+        self.vx = 0.0
+        self.vy = 0.0
+        self.last_mood_check = 0.0
+        self.glyph = "❯"
+        self.color = PINK
+        self.alive = True
+        self.target_speed = 12.0
+        self.trail = []  # [(x, y, age)]
+        self._refresh_mood(force=True)
+
+    def _refresh_mood(self, force=False):
+        now = time.monotonic()
+        if not force and now - self.last_mood_check < self.MOOD_REFRESH:
+            return
+        self.last_mood_check = now
+
+        try:
+            with open(self.STATE_PATH) as f:
+                s = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return
+
+        if not s.get("alive", True):
+            self.alive = False
+            self.glyph = "✕"
+            self.color = OVERLAY1
+            self.target_speed = 0.0
+            return
+
+        # On-the-fly decay (matches nix-pet-glyph) — display only
+        hunger = s.get("hunger", 80)
+        happy = s.get("happiness", 80)
+        last_decay = s.get("last_decay", 0)
+        elapsed_hours = (time.time() - last_decay) / 3600 if last_decay else 0
+        hunger = max(0, int(hunger - elapsed_hours))
+        happy = max(0, int(happy - elapsed_hours / 2))
+        score = (hunger + happy) / 2
+
+        if score >= 70:
+            self.glyph, self.color, self.target_speed = "❯", PINK, 14.0
+        elif score >= 50:
+            self.glyph, self.color, self.target_speed = "❯", MAUVE, 9.0
+        elif score >= 30:
+            self.glyph, self.color, self.target_speed = ">", YELLOW, 5.0
+        elif score >= 10:
+            self.glyph, self.color, self.target_speed = ">", RED, 2.0
+        else:
+            self.glyph, self.color, self.target_speed = "·", RED, 0.6
+        self.alive = True
+
+    def update(self, dt, h, w):
+        self._refresh_mood()
+
+        if not self.alive:
+            return
+
+        # Random direction changes — bouncier when thriving
+        change_chance = 0.04 + (self.target_speed * 0.004)
+        if random.random() < change_chance or (self.vx == 0 and self.vy == 0):
+            angle = random.uniform(0, 2 * math.pi)
+            self.vx = math.cos(angle) * self.target_speed
+            self.vy = math.sin(angle) * self.target_speed * 0.5  # terminal cells are tall
+
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+
+        # Bounce off edges
+        if self.x < 2:
+            self.x = 2
+            self.vx = abs(self.vx)
+        elif self.x >= w - 2:
+            self.x = w - 3
+            self.vx = -abs(self.vx)
+        if self.y < 2:
+            self.y = 2
+            self.vy = abs(self.vy)
+        elif self.y >= h - 2:
+            self.y = h - 3
+            self.vy = -abs(self.vy)
+
+        # Footprint trail
+        self.trail.append((self.x, self.y, 0.0))
+        new_trail = []
+        for tx, ty, age in self.trail:
+            new_age = age + dt
+            if new_age < 1.5:
+                new_trail.append((tx, ty, new_age))
+        self.trail = new_trail[-30:]
+
+    def draw(self, scr, cm, h, w):
+        # Trail first (so Bosun draws over it)
+        for tx, ty, age in self.trail:
+            if age < 0.15:
+                continue  # most recent points are covered by Bosun himself
+            ix, iy = int(tx), int(ty)
+            if not (0 <= iy < h and 0 <= ix < w):
+                continue
+            alpha = max(0.0, 1.0 - age / 1.5) * 0.35
+            color = cm.blend(CRUST, self.color, alpha)
+            pair = cm.get_pair(color)
+            try:
+                scr.addch(iy, ix, "·", pair)
+            except curses.error:
+                pass
+
+        # Bosun himself
+        ix, iy = int(self.x), int(self.y)
+        if 0 <= iy < h and 0 <= ix < w:
+            pair = cm.get_pair(self.color)
+            try:
+                scr.addstr(iy, ix, self.glyph, pair)
+            except curses.error:
+                pass
+
+
 class Particle:
     """A tiny floating dot for ambient texture."""
 
@@ -606,6 +735,7 @@ def dream(stdscr):
         ]
 
     chevron = Chevron()
+    bosun = Bosun(h, w)
     pool = FragmentPool()
     fragments = []
     particles = []
@@ -642,6 +772,10 @@ def dream(stdscr):
 
         # Update & draw chevron
         chevron.draw(stdscr, cm, tick, h, w)
+
+        # Update & draw Bosun (frolicking ambient pet)
+        bosun.update(dt, h, w)
+        bosun.draw(stdscr, cm, h, w)
 
         # Spawn drifting fragments
         if now - last_fragment > random.uniform(3, 7):

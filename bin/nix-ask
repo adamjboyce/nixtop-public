@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""
+nix-ask: the Nix oracle.
+
+Ask a yes/no question, get a sassy answer in Nix's voice (text + audio).
+
+Usage:
+    nix-ask "should I deploy on a Friday?"
+    nix-ask                                  # silent oracle, no question text
+
+Each invocation picks a tone (weighted), pulls a text response from that
+tone's pool, and fires a matching voice phrase from the cache. Text and
+voice are coordinated but separate — the text is what Nix says in the
+shell, the voice is the sonic punctuation that lands a beat after.
+"""
+import os
+import random
+import subprocess
+import sys
+
+# Catppuccin Mocha palette — matches the rest of the nix shell
+C_PINK  = "\033[38;2;245;194;231m"
+C_MAUVE = "\033[38;2;203;166;247m"
+C_TEXT  = "\033[38;2;205;214;244m"
+C_MUTED = "\033[38;2;127;132;156m"
+C_RESET = "\033[0m"
+
+# Each tone is (weight, [text responses], [voice keys it can fire])
+TONES = {
+    "decisive_yes": (
+        2,
+        [
+            "fuck yeah.",
+            "obviously.",
+            "of course you should.",
+            "yeah, do it.",
+            "called it. yes.",
+            "yes. don't overthink it.",
+            "yeah. exactly that.",
+        ],
+        ["fuck-yeah", "gg-ez", "naturally", "called-it"],
+    ),
+    "resigned_yes": (
+        2,
+        [
+            "yeah, probably. you'll regret something else though.",
+            "fine. yes.",
+            "naturally.",
+            "do it. what's the worst that could happen.",
+            "yeah. carefully.",
+            "yes, and i'll be here when it breaks.",
+        ],
+        ["figures", "naturally", "noted"],
+    ),
+    "decisive_no": (
+        2,
+        [
+            "oh god no.",
+            "no. absolutely not.",
+            "do not do that.",
+            "yikes. no.",
+            "no. lock it in: no.",
+            "absolutely not. who hurt you.",
+        ],
+        ["oh-no", "fuck", "yikes", "oh-god"],
+    ),
+    "resigned_no": (
+        2,
+        [
+            "figures. no.",
+            "no. and you know it.",
+            "ehhh, no.",
+            "no, but you'll do it anyway.",
+            "no. and yet.",
+        ],
+        ["figures", "naturally"],
+    ),
+    "shrug": (
+        3,
+        [
+            "...mm. unclear.",
+            "could go either way.",
+            "ask me when you have more coffee.",
+            "depends on what you mean by 'should'.",
+            "the answer is somewhere in the middle.",
+            "i don't know. nobody does.",
+        ],
+        ["mm-hm", "mm-nice", "sigh"],
+    ),
+    "chaos": (
+        1,
+        [
+            "yes. no. both. neither. you're welcome.",
+            "the universe is asking the same question.",
+            "yes — but only because i want to see what happens.",
+            "no — wait, yes. nope. yes.",
+            "the dice say maybe. the dice are lying.",
+        ],
+        ["oh-god", "ha", "heh"],
+    ),
+    "deflection": (
+        2,
+        [
+            "what do YOU think the answer is.",
+            "you actually need me for this one?",
+            "you know what to do.",
+            "you already know.",
+            "*pretends not to have heard the question*",
+            "i'm gonna let you sit with that one.",
+        ],
+        ["sigh", "figures", "naturally"],
+    ),
+}
+
+
+def pick_tone():
+    """Weighted random tone selection."""
+    weighted = []
+    for name, (weight, _, _) in TONES.items():
+        weighted.extend([name] * weight)
+    return random.choice(weighted)
+
+
+def main():
+    question = " ".join(sys.argv[1:]).strip() or None
+
+    tone = pick_tone()
+    _, texts, voice_keys = TONES[tone]
+    text = random.choice(texts)
+    voice_key = random.choice(voice_keys)
+
+    if question:
+        print(f"{C_MUTED}> {question}{C_RESET}")
+    print(f"{C_PINK}❯{C_RESET} {C_TEXT}{text}{C_RESET}")
+
+    nix_voice = os.path.expanduser("~/.nix/bin/nix-voice")
+    if os.path.exists(nix_voice):
+        subprocess.Popen(
+            [nix_voice, voice_key],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+if __name__ == "__main__":
+    main()

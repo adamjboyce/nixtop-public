@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# nix-voice-crit-watch: react to journal entries at crit/alert/emerg level.
+#
+# Distinct from oom-watch: this catches the catastrophic stuff that ISN'T
+# specifically OOM kills — kernel panics, hardware failures, fs corruption
+# warnings. Levels 0-2 (emerg, alert, crit). Debounced to 30s so a flood
+# of related crit messages from one event collapses to one fire.
+
+set -euo pipefail
+
+debounce_until=0
+
+exec journalctl --follow --since now -p crit 2>/dev/null \
+| while IFS= read -r line; do
+    now=$(date +%s)
+    if (( now >= debounce_until )); then
+        "$HOME/.nix/bin/nix-voice" oh-no 2>/dev/null || true
+        debounce_until=$(( now + 30 ))
+    fi
+done

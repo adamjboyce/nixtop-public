@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""
+nix-dice: D&D-style dice roller with reactions.
+
+    nix-dice              # default 1d20
+    nix-dice 2d6+3
+    nix-dice d100
+
+Used when picking between features/options. Voice fire matches roll quality:
+nat 20 → fuck-yeah, nat 1 → yikes, midrange → mm-hm, etc.
+"""
+import os
+import random
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+C_PINK  = "\033[38;2;245;194;231m"
+C_MAUVE = "\033[38;2;203;166;247m"
+C_TEXT  = "\033[38;2;205;214;244m"
+C_MUTED = "\033[38;2;127;132;156m"
+C_RESET = "\033[0m"
+
+NIX_VOICE = Path.home() / ".nix" / "bin" / "nix-voice"
+
+
+def fire(key):
+    if NIX_VOICE.exists():
+        try:
+            subprocess.Popen(
+                [str(NIX_VOICE), key],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+
+PATTERN = re.compile(r"^(?P<n>\d*)d(?P<s>\d+)(?P<mod>[+-]\d+)?$", re.I)
+
+
+def react(rolls, sides, total):
+    if len(rolls) == 1 and sides == 20 and rolls[0] == 20:
+        return "natural twenty.", "fuck-yeah"
+    if len(rolls) == 1 and sides == 20 and rolls[0] == 1:
+        return "natural one. yikes.", "yikes"
+    if len(rolls) > 1 and any(r == sides for r in rolls):
+        return "max'd at least one.", "called-it"
+    if len(rolls) > 1 and all(r == 1 for r in rolls):
+        return "snake eyes.", "figures"
+
+    pct = sum(rolls) / (sides * len(rolls))
+    if pct >= 0.85:
+        return "good roll.", "nice"
+    if pct >= 0.6:
+        return "decent.", "noted"
+    if pct >= 0.4:
+        return "mm. mid.", "mm-hm"
+    if pct >= 0.2:
+        return "rough.", "figures"
+    return "ouch.", "ouch"
+
+
+def main():
+    expr = (sys.argv[1] if len(sys.argv) > 1 else "1d20").strip().lower()
+    m = PATTERN.match(expr)
+    if not m:
+        print(f"{C_MUTED}usage: nix-dice [NdS+M]   e.g. nix-dice 2d6+3{C_RESET}")
+        return
+
+    n = int(m.group("n") or 1)
+    s = int(m.group("s"))
+    mod = int(m.group("mod") or 0)
+
+    if not (1 <= n <= 100) or not (2 <= s <= 1000):
+        print(f"{C_MUTED}out of range — keep it sane{C_RESET}")
+        return
+
+    rolls = [random.randint(1, s) for _ in range(n)]
+    total = sum(rolls) + mod
+    rolls_str = " + ".join(str(r) for r in rolls)
+    mod_str = f" {mod:+d}" if mod else ""
+    text, voice = react(rolls, s, total)
+
+    print(f"{C_MUTED}> {expr}{C_RESET}")
+    print(
+        f"{C_PINK}❯{C_RESET} {C_TEXT}{rolls_str}{mod_str}{C_RESET} "
+        f"{C_PINK}={C_RESET} {C_TEXT}{total}{C_RESET}  {C_MAUVE}{text}{C_RESET}"
+    )
+    fire(voice)
+
+
+if __name__ == "__main__":
+    main()

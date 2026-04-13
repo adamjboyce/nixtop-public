@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# nix-voice-system-check: polled multi-signal system health voice trigger.
+# Replaces nix-voice-failed-units. Single timer, single state file, multiple
+# moods. State is keyed by signal name in ~/.nix/voice/.system-check-state.
+#
+# Signals (each gated to fire only on transition, never on persistent state):
+#   failed units increased  → yikes
+#   failed units recovered  → clean
+#   disk usage > 90% on /   → yikes (one-shot until back below)
+#   disk usage > 90% on /home → yikes (one-shot)
+#   battery < 10% & on bat  → oh-no (one-shot until charging or recovers)
+#
+# First-ever run never fires anything — bootstrap the baseline silently.
+
+set -euo pipefail
+
+STATE="$HOME/.nix/voice/.system-check-state"
+NIX_VOICE="$HOME/.nix/bin/nix-voice"
+
+# --- read previous state -------------------------------------------------
+declare -A prev
+if [[ -f "$STATE" ]]; then
+    while IFS='=' read -r k v; do
+        [[ -n "$k" ]] && prev[$k]="$v"
+    done < "$STATE"
+fi
+first_run=$([[ -f "$STATE" ]] && echo 0 || echo 1)
+
+# --- collect current state ----------------------------------------------
+declare -A cur
+
+cur[failed_units]=$(systemctl --failed --no-legend 2>/dev/null | wc -l)
+
+cur[disk_root]=$(df --output=pcent / 2>/dev/null | tail -1 | tr -d ' %')
+cur[disk_home]=$(df --output=pcent /home 2>/dev/null | tail -1 | tr -d ' %')
+
+# Battery — degrade gracefully if no battery present
+bat_path=$(ls -d /sys/class/power_supply/BAT* 2>/dev/null | head -1 || true)
+if [[ -n "$bat_path" ]]; then
+    cur[bat_pct]=$(cat "$bat_path/capacity" 2>/dev/null || echo 100)
+    cur[bat_status]=$(cat "$bat_path/status" 2>/dev/null || echo Unknown)
+else
+    cur[bat_pct]=100
+    cur[bat_status]=NotPresent
+fi
+
+# --- write new state up front so reactions don't double-fire ------------
+{
+    for k in "${!cur[@]}"; do
+        echo "$k=${cur[$k]}"
+    done
+} > "$STATE"
+
+# Bootstrap: never fire on first run
+if [[ "$first_run" == "1" ]]; then
+    exit 0
+fi
+
+# --- compare and react --------------------------------------------------
+fire() { "$NIX_VOICE" "$1" 2>/dev/null || true; }
+
+# Bosun lives. Tick the pet's decay every check so he ages in the
+# background — without this, his stats only update when nix-pet runs
+# manually and his prompt glyph drifts away from reality. The `tick`
+# subcommand also rolls for misbehavior, so Bosun acts up on this
+# timer's cadence even if Adam never opens nix-pet directly.
+[[ -x "$HOME/.nix/bin/nix-pet" ]] && "$HOME/.nix/bin/nix-pet" tick >/dev/null 2>&1 || true
+
+# Failed units transitions
+prev_failed=${prev[failed_units]:-0}
+if (( cur[failed_units] > prev_failed )); then
+    fire yikes
+elif (( cur[failed_units] < prev_failed )) && (( prev_failed > 0 )); then
+    fire clean
+fi
+
+# Disk space — fire only on crossing the threshold
+disk_threshold=90
+for mount in root home; do
+    key="disk_$mount"
+    cur_pct=${cur[$key]:-0}
+    prev_pct=${prev[$key]:-0}
+    if (( cur_pct >= disk_threshold )) && (( prev_pct < disk_threshold )); then
+        fire yikes
+    fi
+done
+
+# Battery — fire only when crossing 10% on battery (not charging)
+bat_threshold=10
+prev_bat_pct=${prev[bat_pct]:-100}
+prev_bat_status=${prev[bat_status]:-Unknown}
+if [[ "${cur[bat_status]}" == "Discharging" ]] \
+   && (( cur[bat_pct] <= bat_threshold )) \
+   && ! { [[ "$prev_bat_status" == "Discharging" ]] && (( prev_bat_pct <= bat_threshold )); }; then
+    fire oh-no
+fi
+
+# CPU thermal stress — fire `yikes` if max thermal zone crosses 80C from
+# below. Reads all thermal_zone temps in millidegrees and takes the max
+# so we don't depend on which zone is the package sensor.
+max_temp=0
+for tz in /sys/class/thermal/thermal_zone*/temp; do
+    if [[ -r "$tz" ]]; then
+        t=$(cat "$tz" 2>/dev/null || echo 0)
+        t=$(( t / 1000 ))
+        (( t > max_temp )) && max_temp=$t
+    fi
+done
+cur[max_temp]=$max_temp
+echo "max_temp=$max_temp" >> "$STATE"
+prev_max_temp=${prev[max_temp]:-0}
+if (( max_temp >= 80 )) && (( prev_max_temp < 80 )); then
+    fire yikes
+fi
+
+# High sustained load — fire `easy` if 5min loadavg crosses ncpu*1.5
+# from below. The voice is the calming reminder that nothing is on fire
+# even if the box feels under it.
+ncpu=$(nproc 2>/dev/null || echo 4)
+load5=$(awk '{print $2}' /proc/loadavg)
+load_threshold=$(awk -v n="$ncpu" 'BEGIN { printf "%.2f", n * 1.5 }')
+prev_load5=${prev[load5]:-0}
+cur[load5]="$load5"
+echo "load5=$load5" >> "$STATE"
+crossed=$(awk -v c="$load5" -v p="$prev_load5" -v t="$load_threshold" \
+    'BEGIN { print (c+0 >= t+0 && p+0 < t+0) ? 1 : 0 }')
+if [[ "$crossed" == "1" ]]; then
+    fire easy
+fi
+
+# Boot-time error report — fires once per boot, on first check after a
+# kernel reboot (detected by current uptime being LESS than last seen).
+# If journalctl shows >5 errors in this boot, fire yikes as a heads-up
+# that the boot wasn't clean.
+boot_state="$HOME/.nix/voice/.last-boot-uptime"
+current_uptime=$(awk '{print int($1)}' /proc/uptime)
+last_uptime=0
+[[ -f "$boot_state" ]] && last_uptime=$(cat "$boot_state" 2>/dev/null || echo 0)
+echo "$current_uptime" > "$boot_state"
+if (( current_uptime < last_uptime )) || [[ "$last_uptime" == "0" && "$first_run" != "1" ]]; then
+    err_count=$(journalctl -b -p err --no-pager 2>/dev/null | wc -l)
+    if (( err_count > 5 )); then
+        fire yikes
+    fi
+fi

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Global git pre-push hook: fire a voice phrase based on what's being pushed.
+#
+# Reads the standard pre-push stdin contract:
+#   <local ref> <local sha> <remote ref> <remote sha>  (one line per refspec)
+#
+# Phrase logic (first match wins):
+#   --force / --force-with-lease detected   → `yikes` (you're really doing it)
+#   pushing to refs/heads/main or master    → `there-it-is` (real shipping)
+#   anything else                           → silent (post-commit handled it)
+#
+# Force detection: git pre-push doesn't get the original argv, but it does
+# expose GIT_PUSH_OPTION_* and we can also check whether the local sha is
+# an ancestor of the remote sha (non-ancestor = force-y).
+
+set -euo pipefail
+
+# Read all refspecs from stdin
+input=$(cat || true)
+
+if [[ -z "$input" ]]; then
+    exit 0
+fi
+
+fire() { "$HOME/.nix/bin/nix-voice" "$1" 2>/dev/null || true; }
+
+# Check each refspec for the conditions we care about.
+# Process the first interesting one, then exit.
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [[ -z "$remote_ref" ]] && continue
+
+    # Detect force push: local sha is not a descendant of remote sha
+    # (and remote sha is not all-zeros which means new branch).
+    if [[ "$remote_sha" != "0000000000000000000000000000000000000000" ]] \
+       && [[ -n "$local_sha" ]] && [[ "$local_sha" != "0000000000000000000000000000000000000000" ]]; then
+        if ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+            fire yikes
+            exit 0
+        fi
+    fi
+
+    # Detect push to main/master
+    case "$remote_ref" in
+        refs/heads/main|refs/heads/master)
+            fire there-it-is
+            exit 0
+            ;;
+    esac
+done <<< "$input"
+
+exit 0

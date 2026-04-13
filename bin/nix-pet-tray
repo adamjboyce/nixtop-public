@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""
+nix-pet-tray: persistent system tray icon for the pet.
+
+The icon glyph + color reflect Bosun's mood. Markers (!/+) appear for
+unscolded misbehavior and unthanked presents. Tooltip shows full stats.
+Left-click opens the OSD popup. Right-click context menu has quick
+actions for feed/pet/walk/scold/thanks/praise/open/quit.
+
+Lives as a user systemd service (graphical-session.target). Auto-refreshes
+every 5 seconds from the same state file everything else reads.
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# Re-exec under the venv interpreter so the systemd unit doesn't need to know.
+VENV_PY = Path.home() / ".nix" / "voice" / ".venv" / "bin" / "python3"
+if VENV_PY.exists() and sys.executable != str(VENV_PY):
+    os.execv(str(VENV_PY), [str(VENV_PY), __file__] + sys.argv[1:])
+
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont
+from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
+
+NIX_PET     = Path.home() / ".nix" / "bin" / "nix-pet"
+NIX_PET_OSD = Path.home() / ".nix" / "bin" / "nix-pet-osd"
+STATE_FILE  = Path.home() / ".nix" / "voice" / ".pet-state"
+
+# Catppuccin Mocha
+PINK   = "#f5c2e7"
+MAUVE  = "#cba6f7"
+YELLOW = "#f9e2af"
+RED    = "#f38ba8"
+MUTED  = "#7f849c"
+PEACH  = "#fab387"
+
+
+def load_state():
+    if not STATE_FILE.exists():
+        return None
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return None
+
+
+def stage_of(s):
+    age_h = (time.time() - s.get("born", 0)) / 3600
+    stages = [(0, "egg"), (6, "hatchling"), (30, "pup"), (72, "juvenile"),
+              (144, "adult"), (264, "elder")]
+    cur = "egg"
+    for h, n in stages:
+        if age_h >= h:
+            cur = n
+    return cur, age_h
+
+
+def mood_of(s):
+    """Return (glyph, color_hex, label)."""
+    if not s.get("alive", True):
+        return ("✕", MUTED, "departed")
+    if stage_of(s)[0] == "egg":
+        return ("o", YELLOW, "incubating")
+    score = (s.get("hunger", 0) + s.get("happiness", 0)) / 2
+    if score >= 70: return ("❯", PINK,   "thriving")
+    if score >= 50: return ("❯", MAUVE,  "content")
+    if score >= 30: return (">", YELLOW, "okay")
+    if score >= 10: return (">", RED,    "struggling")
+    return ("·", RED, "barely there")
+
+
+def make_icon(glyph, color_hex, marker=None):
+    """Paint a glyph + optional marker into a 22x22 tray pixmap."""
+    size = 22
+    pix = QPixmap(size, size)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setRenderHint(QPainter.TextAntialiasing)
+
+    painter.setPen(QColor(color_hex))
+    font = QFont("Hack", 14, QFont.Bold)
+    painter.setFont(font)
+    painter.drawText(pix.rect(), Qt.AlignCenter, glyph)
+
+    if marker:
+        marker_font = QFont("Hack", 9, QFont.Bold)
+        painter.setFont(marker_font)
+        painter.setPen(QColor(RED if marker == "!" else PEACH))
+        painter.drawText(pix.rect().adjusted(0, 0, -1, -1),
+                         Qt.AlignTop | Qt.AlignRight, marker)
+
+    painter.end()
+    return QIcon(pix)
+
+
+class PetTray(QSystemTrayIcon):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+
+        menu = QMenu()
+        self.feed_action   = menu.addAction("feed")
+        self.pet_action    = menu.addAction("pet")
+        self.walk_action   = menu.addAction("walk")
+        menu.addSeparator()
+        self.scold_action  = menu.addAction("scold")
+        self.thanks_action = menu.addAction("thanks")
+        self.praise_action = menu.addAction("praise")
+        menu.addSeparator()
+        open_action = menu.addAction("open OSD")
+        menu.addSeparator()
+        quit_action = menu.addAction("quit tray")
+
+        self.feed_action.triggered.connect(lambda: self._do("feed"))
+        self.pet_action.triggered.connect(lambda: self._do("pet"))
+        self.walk_action.triggered.connect(lambda: self._do("walk"))
+        self.scold_action.triggered.connect(lambda: self._do("scold"))
+        self.thanks_action.triggered.connect(lambda: self._do("thanks"))
+        self.praise_action.triggered.connect(lambda: self._do("praise"))
+        open_action.triggered.connect(self._open_osd)
+        quit_action.triggered.connect(self.app.quit)
+
+        self.setContextMenu(menu)
+        self.activated.connect(self._on_activated)
+
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.refresh)
+        self.refresh_timer.start(5000)
+        self.refresh()
+
+    def refresh(self):
+        s = load_state()
+        if s is None:
+            self.setIcon(make_icon("·", MUTED))
+            self.setToolTip("nix-pet: no state")
+            return
+
+        glyph, color, label = mood_of(s)
+        marker = None
+        if s.get("recent_misbehavior"):
+            marker = "!"
+        elif s.get("recent_present"):
+            marker = "+"
+        self.setIcon(make_icon(glyph, color, marker))
+
+        name = s.get("name", "?")
+        stage_name, age_h = stage_of(s)
+        if stage_name == "egg":
+            hatch_in = max(0, 6 - int(age_h))
+            tip = f"{name} (egg)\nhatches in {hatch_in}h"
+        elif s.get("alive", True):
+            tip = (
+                f"{name} ({stage_name}, {label})\n"
+                f"hunger {s.get('hunger',0)}/100   happiness {s.get('happiness',0)}/100\n"
+                f"food bowl {s.get('food_bowl',0)}/10   age {int(age_h)}h"
+            )
+            mb = s.get("recent_misbehavior")
+            gp = s.get("recent_present")
+            if mb:
+                tip += f"\n! {mb['msg']}"
+            if gp:
+                tip += f"\n+ {gp['msg']}"
+        else:
+            tip = f"{name} (departed)\nnew egg incoming"
+        self.setToolTip(tip)
+
+        # Gate menu actions by capability
+        caps_walk = stage_name in ("pup", "juvenile", "adult", "elder")
+        self.feed_action.setEnabled(stage_name != "egg")
+        self.pet_action.setEnabled(stage_name != "egg")
+        self.walk_action.setEnabled(caps_walk)
+        self.scold_action.setEnabled(bool(s.get("recent_misbehavior")))
+        self.thanks_action.setEnabled(bool(s.get("recent_present")))
+
+    def _do(self, action):
+        try:
+            subprocess.run(
+                [str(NIX_PET), action], timeout=4,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+        self.refresh()
+
+    def _open_osd(self):
+        # Don't spawn if one's already alive — check pidfile first.
+        pidfile = Path.home() / ".nix" / "voice" / ".osd.pid"
+        if pidfile.exists():
+            try:
+                old = int(pidfile.read_text().strip())
+                os.kill(old, 0)
+                return  # already running
+            except (OSError, ValueError):
+                pass  # stale, fall through
+        try:
+            subprocess.Popen(
+                [str(NIX_PET_OSD)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception:
+            pass
+
+    def _on_activated(self, reason):
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self._open_osd()
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        print("system tray not available", file=sys.stderr)
+        sys.exit(1)
+    tray = PetTray(app)
+    tray.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

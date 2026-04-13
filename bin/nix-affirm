@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""
+nix-affirm: backhanded affirmations. The faintest possible praise.
+Used when Adam needs encouragement after a rough beat.
+"""
+import os
+import random
+import subprocess
+import sys
+from pathlib import Path
+
+C_PINK  = "\033[38;2;245;194;231m"
+C_TEXT  = "\033[38;2;205;214;244m"
+C_MUTED = "\033[38;2;127;132;156m"
+C_RESET = "\033[0m"
+
+NIX_VOICE = Path.home() / ".nix" / "bin" / "nix-voice"
+
+
+def fire(key):
+    if NIX_VOICE.exists():
+        try:
+            subprocess.Popen(
+                [str(NIX_VOICE), key],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+
+AFFIRMATIONS = [
+    ("your variable naming is consistent.",                                       "nice"),
+    ("your test coverage is acceptable.",                                          "mm-nice"),
+    ("you remembered to commit at least once today.",                              "noted"),
+    ("most of your indentation matches.",                                          "naturally"),
+    ("you closed the brace.",                                                       "called-it"),
+    ("you're using a linter, which is more than i can say for some.",              "mm-hm"),
+    ("your branch name is at least descriptive enough.",                           "noted"),
+    ("the function does, in fact, return.",                                        "nice"),
+    ("you've drunk water within the last six hours, statistically.",               "mm-hm"),
+    ("your README has more than one paragraph.",                                   "noted"),
+    ("the code is readable to someone who already knows what it does.",            "naturally"),
+    ("you have not yet `chmod 777`-ed anything important.",                        "called-it"),
+    ("you noticed the typo before i did. probably.",                               "naturally"),
+    ("the regex isn't egregious.",                                                  "mm-nice"),
+    ("you're not the worst engineer i've worked with today.",                       "ha"),
+    ("you opened the file. half the battle.",                                       "mm-hm"),
+    ("you have not pushed to main without thinking about it.",                     "naturally"),
+    ("the diff is small. small enough. it's a small diff.",                         "noted"),
+    ("you wrote the comment, even though it's wrong now.",                          "nice"),
+    ("you've taken a sip of something within recent memory.",                       "mm-hm"),
+    ("you didn't blame the compiler this time.",                                    "called-it"),
+    ("the function name is what the function does. mostly.",                        "noted"),
+    ("you saved the file before alt-tabbing. probably.",                            "mm-hm"),
+    ("the build is green. for now.",                                                "nice"),
+]
+
+
+def main():
+    text, voice = random.choice(AFFIRMATIONS)
+    print(f"{C_PINK}❯{C_RESET} {C_TEXT}{text}{C_RESET}")
+    fire(voice)
+
+
+if __name__ == "__main__":
+    main()

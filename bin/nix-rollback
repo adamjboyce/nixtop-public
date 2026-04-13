@@ -345,6 +345,10 @@ def cmd_undo(args):
     if result.strip():
         print(result)
     print(f"  {C_GREEN}done.{C_RESET} changes reverted.")
+    subprocess.Popen(
+        [os.path.expanduser("~/.nix/bin/nix-voice"), "oh-no"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
 
 
 # -- rollback ------------------------------------------------------
@@ -410,6 +414,10 @@ def cmd_rollback(args):
     print(f"  {C_GREEN}rollback complete.{C_RESET}")
     print(f"  {C_YELLOW}reboot to boot into snapshot {n}.{C_RESET}")
     print(f"  {C_MUTED}(your current state is preserved as a read-only snapshot){C_RESET}")
+    subprocess.Popen(
+        [os.path.expanduser("~/.nix/bin/nix-voice"), "oh-no"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
 
 
 # -- help ----------------------------------------------------------

@@ -1,0 +1,738 @@
+#!/usr/bin/env python3
+"""
+nix-pet: a cursed terminal tamagotchi. The pet IS the chevron.
+
+State at ~/.nix/voice/.pet-state (json). Decays over time. Eats from a
+food bowl Adam fills. Walks for exercise. Misbehaves occasionally. Can
+be scolded, praised, fed, petted. Dies of neglect or starvation.
+
+Commands:
+    nix-pet                 status (default)
+    nix-pet feed            +3 portions to the food bowl
+    nix-pet pet             +15 happiness
+    nix-pet walk            animated walk: +25 happy / -10 hunger / 1h cooldown
+    nix-pet scold           clears unscolded misbehavior, -5 happiness
+    nix-pet praise          +10 happiness
+    nix-pet name <name>     rename
+    nix-pet revive          bring back from the dead
+    nix-pet tick            apply background decay + roll bowl/misbehavior
+                            (called by system-check timer)
+    nix-pet misbehave       (debug) force a misbehavior
+
+Decay model:
+    hunger -1/hour, happiness -1/2hr
+    if bowl > 0 and hunger < 60, eat one portion (+30 hunger)
+    death:
+      hunger == 0 for >24h    → starved
+      happiness == 0 for >48h → neglected
+"""
+import json
+import os
+import random
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+C_PINK   = "\033[38;2;245;194;231m"
+C_MAUVE  = "\033[38;2;203;166;247m"
+C_TEXT   = "\033[38;2;205;214;244m"
+C_MUTED  = "\033[38;2;127;132;156m"
+C_GREEN  = "\033[38;2;166;227;161m"
+C_RED    = "\033[38;2;243;139;168m"
+C_YELLOW = "\033[38;2;249;226;175m"
+C_PEACH  = "\033[38;2;250;179;135m"
+C_RESET  = "\033[0m"
+
+NIX_VOICE = Path.home() / ".nix" / "bin" / "nix-voice"
+STATE_FILE = Path.home() / ".nix" / "voice" / ".pet-state"
+
+NAMES = [
+    "bilge", "scout", "pip", "smudge", "sprocket", "ditto", "anchor",
+    "bosun", "hardtack", "nibbler", "plank", "shoal", "swab", "yarrow",
+    "biscuit", "tinder", "rook", "puddle", "ember", "fizz",
+]
+
+# (kind, message) — what Bosun did when he misbehaves
+MISBEHAVIORS = [
+    ("chewed",   "bosun chewed something. there are pieces."),
+    ("yarfed",   "bosun yarfed on the carpet."),
+    ("knocked",  "bosun knocked something off the table."),
+    ("stole",    "bosun stole a sock. it's hidden somewhere."),
+    ("plotted",  "bosun was found in a place he shouldn't be. plotting."),
+    ("yelled",   "bosun yelled at the void for an hour."),
+    ("hidden",   "bosun was missing for 30 minutes. now he's back. with attitude."),
+    ("zoomies",  "bosun got the zoomies and broke the energy economy."),
+    ("staring",  "bosun has been staring at the wall. you don't like it."),
+    ("dug",      "bosun dug a hole in the carpet, looking for something."),
+    ("ate-cable", "bosun chewed on the laptop charging cable. you have a feeling."),
+    ("rebooted", "bosun stepped on the keyboard. you almost lost an unsaved file."),
+]
+
+# (kind, message) — Bosun's well-intentioned-but-cursed offerings
+PRESENTS = [
+    ("mouse",    "bosun left half a mouse on your pillow. proudly."),
+    ("feathers", "bosun left a feather collection on the keyboard."),
+    ("sock",     "bosun left a sock at your front door. it's not yours."),
+    ("pebbles",  "bosun left an inscrutable arrangement of pebbles by the bed."),
+    ("leaf",     "bosun left a dead leaf, neatly centered on your work."),
+    ("hairball", "bosun left a hairball where you'll find it with bare feet."),
+    ("twig",     "bosun left a single perfect twig in your shoe."),
+    ("bone",     "bosun left a tiny bone next to your coffee. unclear origin."),
+    ("string",   "bosun left a length of mysterious string. it's tied in a knot."),
+    ("button",   "bosun left a button he definitely did not just chew off something."),
+    ("worm",     "bosun left a worm. it's still moving."),
+    ("note",     "bosun left a note. you can't read it. it's unclear what language."),
+]
+
+WALK_COOLDOWN_SECS = 3600
+MISBEHAVE_CHANCE_PER_TICK = 0.012  # ~1.2% per 5min check ≈ once per ~7h
+PRESENT_CHANCE_PER_TICK   = 0.010  # ~1.0% per 5min check ≈ once per ~8h
+BOWL_MAX = 10
+PORTION_HUNGER = 30
+
+# Life stages — (min_age_hours, name). Each pet has a ~14-day lifecycle.
+# Reaching each stage triggers a notification + voice fire. After death,
+# a new pet is auto-spawned with a new name — generations, not immortality.
+STAGES = [
+    (0,    "egg"),        # 0-6h     no decay, no interaction
+    (6,    "hatchling"),  # 6-30h    care phase, decay begins, sit only
+    (30,   "pup"),        # 30-72h   walking + rollover unlock
+    (72,   "juvenile"),   # 72-144h  misbehavior + shake unlock
+    (144,  "adult"),      # 144-264h presents + play-dead + speak unlock (5 days)
+    (264,  "elder"),      # 264-336h fetch unlocks, chilled out, grace period (3 days)
+]
+OLD_AGE_HOURS = 336  # ~14 days — natural death cap
+
+
+def stage_of(s):
+    age_hours = (now() - s["born"]) / 3600
+    current = STAGES[0][1]
+    for min_age, name in STAGES:
+        if age_hours >= min_age:
+            current = name
+    return current
+
+
+# Per-stage announcement when Bosun ages up — joy moments
+STAGE_TRANSITIONS = {
+    "hatchling": ("hatched!",          f"the egg cracked. say hi."),
+    "pup":       ("grew into a pup",   "walking unlocked. try `nix-pet walk`."),
+    "juvenile":  ("became a juvenile", "misbehavior unlocked. expect chaos."),
+    "adult":     ("became an adult",   "presents unlocked. brace yourself."),
+    "elder":     ("became an elder",   "fully grown. fewer problems, more gifts."),
+}
+
+
+def stage_caps(s):
+    """What's unlocked at the current stage."""
+    st = stage_of(s)
+    caps = {
+        "stage": st,
+        "decay": True,
+        "feed": True,
+        "pet": True,
+        "walk": False,
+        "misbehavior": False,
+        "presents": False,
+        "tricks": [],
+        "death_grace_secs": 0,
+        "misbehave_chance_mult": 1.0,
+        "present_chance_mult": 1.0,
+    }
+    if st == "egg":
+        # Egg just sits there. No decay, no interactions.
+        caps["decay"] = False
+        caps["feed"] = False
+        caps["pet"] = False
+        return caps
+    if st == "hatchling":
+        caps["tricks"] = ["sit"]
+    elif st == "pup":
+        caps["walk"] = True
+        caps["tricks"] = ["sit", "rollover"]
+    elif st == "juvenile":
+        caps["walk"] = True
+        caps["misbehavior"] = True
+        caps["tricks"] = ["sit", "rollover", "shake"]
+    elif st == "adult":
+        caps["walk"] = True
+        caps["misbehavior"] = True
+        caps["presents"] = True
+        caps["tricks"] = ["sit", "rollover", "shake", "play-dead", "speak"]
+    elif st == "elder":
+        caps["walk"] = True
+        caps["misbehavior"] = True
+        caps["presents"] = True
+        caps["tricks"] = ["sit", "rollover", "shake", "play-dead", "speak", "fetch"]
+        caps["death_grace_secs"] = 86400
+        caps["misbehave_chance_mult"] = 0.5
+        caps["present_chance_mult"] = 1.5
+    return caps
+
+
+def fire(key):
+    if NIX_VOICE.exists():
+        try:
+            subprocess.Popen(
+                [str(NIX_VOICE), key],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+
+def notify(title, body, urgency="normal"):
+    """Fire a KDE/libnotify notification. Silent on failure."""
+    try:
+        subprocess.Popen(
+            ["notify-send", "-u", urgency, "-a", "nix-pet", title, body],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def now():
+    return int(time.time())
+
+
+def new_pet(exclude_name=None):
+    """Create a new pet with a random name. Avoids the previous name to
+    keep generations distinct."""
+    pool = [n for n in NAMES if n != exclude_name] if exclude_name else NAMES
+    return {
+        "name": random.choice(pool),
+        "born": now(),
+        "last_decay": now(),
+        "last_known_stage": "egg",
+        "previous_pets": [],
+        "hunger": 80,
+        "happiness": 80,
+        "alive": True,
+        "death_cause": None,
+        "death_time": None,
+        "starving_since": None,
+        "sad_since": None,
+        # New fields
+        "food_bowl": 3,           # portions
+        "last_walk": 0,
+        "recent_misbehavior": None,  # {"kind": str, "msg": str, "time": int}
+        "recent_present": None,      # {"kind": str, "msg": str, "time": int}
+        "total_misbehaviors": 0,
+        "total_presents": 0,
+        "total_scolds": 0,
+        "total_praises": 0,
+        "total_thanks": 0,
+        "total_walks": 0,
+    }
+
+
+def load_state():
+    if not STATE_FILE.exists():
+        return None
+    try:
+        s = json.loads(STATE_FILE.read_text())
+    except Exception:
+        return None
+    # Backward-compat: hydrate any missing new fields onto an old pet
+    defaults = {
+        "food_bowl": 3,
+        "last_walk": 0,
+        "recent_misbehavior": None,
+        "recent_present": None,
+        "total_misbehaviors": 0,
+        "total_presents": 0,
+        "total_scolds": 0,
+        "total_praises": 0,
+        "total_thanks": 0,
+        "total_walks": 0,
+        "last_known_stage": "egg",
+        "previous_pets": [],
+    }
+    for k, v in defaults.items():
+        s.setdefault(k, v)
+    return s
+
+
+def save_state(s):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(s, indent=2))
+
+
+def decay(s):
+    """Apply time-based decay since last_decay; eat from bowl; check death.
+    Eggs don't decay — they just wait to hatch."""
+    if not s["alive"]:
+        return s
+    if not stage_caps(s)["decay"]:
+        s["last_decay"] = now()
+        return s
+
+    elapsed = now() - s["last_decay"]
+    s["last_decay"] = now()
+
+    hours = elapsed / 3600
+    s["hunger"] = max(0, int(s["hunger"] - hours))
+    s["happiness"] = max(0, int(s["happiness"] - hours / 2))
+
+    # Eat from the bowl if hungry and food is available
+    if s["hunger"] < 60 and s["food_bowl"] > 0:
+        s["food_bowl"] -= 1
+        s["hunger"] = min(100, s["hunger"] + PORTION_HUNGER)
+
+    # Unscolded misbehavior makes him slowly sadder (he feels bad about it too)
+    if s.get("recent_misbehavior"):
+        s["happiness"] = max(0, s["happiness"] - 1)
+
+    # Unthanked presents also make him sadder (he feels unappreciated)
+    if s.get("recent_present"):
+        s["happiness"] = max(0, s["happiness"] - 1)
+
+    # Track time at zero
+    if s["hunger"] == 0:
+        if s.get("starving_since") is None:
+            s["starving_since"] = now()
+    else:
+        s["starving_since"] = None
+
+    if s["happiness"] == 0:
+        if s.get("sad_since") is None:
+            s["sad_since"] = now()
+    else:
+        s["sad_since"] = None
+
+    # Death conditions — elder Bosun gets a grace period
+    caps = stage_caps(s)
+    grace = caps["death_grace_secs"]
+
+    # Old age — natural cap at OLD_AGE_HOURS regardless of care
+    age_hours = (now() - s["born"]) / 3600
+    if age_hours >= OLD_AGE_HOURS:
+        s["alive"] = False
+        s["death_cause"] = "old age"
+        s["death_time"] = now()
+        fire("ouch")
+        notify(f"{s['name']} passed peacefully", f"old age. lived a full {int(age_hours/24)} days.")
+    elif s.get("starving_since") and now() - s["starving_since"] > 86400 + grace:
+        s["alive"] = False
+        s["death_cause"] = "starvation"
+        s["death_time"] = now()
+        fire("oh-no")
+        notify(f"{s['name']} has died", "starvation. fill the bowl next time.", "critical")
+    elif s.get("sad_since") and now() - s["sad_since"] > 172800 + grace:
+        s["alive"] = False
+        s["death_cause"] = "neglect"
+        s["death_time"] = now()
+        fire("oh-no")
+        notify(f"{s['name']} has died", "neglect. pet him sometimes.", "critical")
+
+    return s
+
+
+def maybe_age_up(s):
+    """Detect stage transitions since last_known_stage and announce them."""
+    if not s["alive"]:
+        return s
+    cur = stage_of(s)
+    last = s.get("last_known_stage", "egg")
+    if cur == last:
+        return s
+    s["last_known_stage"] = cur
+    if cur in STAGE_TRANSITIONS:
+        title_suffix, body = STAGE_TRANSITIONS[cur]
+        notify(f"{s['name']} {title_suffix}", body)
+        fire("there-it-is" if cur == "hatchling" else "nice")
+    return s
+
+
+def maybe_replace(s):
+    """If Bosun is dead, spawn a new pet with a new name. Generations."""
+    if s["alive"]:
+        return s
+    # Save the dead pet to history before replacing
+    old_name = s["name"]
+    old_age_hours = (s.get("death_time", now()) - s["born"]) // 3600
+    history_entry = {
+        "name": old_name,
+        "lived_hours": old_age_hours,
+        "death_cause": s.get("death_cause", "unknown"),
+        "died_at": s.get("death_time", now()),
+    }
+    history = s.get("previous_pets", [])
+    history.append(history_entry)
+    history = history[-10:]  # cap at 10 most recent
+
+    fresh = new_pet(exclude_name=old_name)
+    fresh["previous_pets"] = history
+    notify(f"a new egg appeared", f"say hi to {fresh['name']}. ({old_name} lived {old_age_hours}h)")
+    fire("welcome-home")
+    return fresh
+
+
+def maybe_misbehave(s, force=False):
+    """Roll for a misbehavior. Gated on stage — hatchlings/pups can't misbehave."""
+    if not s["alive"]:
+        return s
+    caps = stage_caps(s)
+    if not caps["misbehavior"] and not force:
+        return s
+    if s.get("recent_misbehavior") and not force:
+        return s
+    chance = MISBEHAVE_CHANCE_PER_TICK * caps["misbehave_chance_mult"]
+    if not force and random.random() > chance:
+        return s
+
+    kind, msg = random.choice(MISBEHAVIORS)
+    s["recent_misbehavior"] = {"kind": kind, "msg": msg, "time": now()}
+    s["total_misbehaviors"] += 1
+    fire("sigh")  # the voice catch sigh
+    notify(f"{s['name']} has been a problem", msg)
+    return s
+
+
+def maybe_present(s, force=False):
+    """Roll for a present (cat-coded gift). Gated on stage — only adults+."""
+    if not s["alive"]:
+        return s
+    caps = stage_caps(s)
+    if not caps["presents"] and not force:
+        return s
+    if s.get("recent_present") and not force:
+        return s
+    chance = PRESENT_CHANCE_PER_TICK * caps["present_chance_mult"]
+    if not force and random.random() > chance:
+        return s
+
+    kind, msg = random.choice(PRESENTS)
+    s["recent_present"] = {"kind": kind, "msg": msg, "time": now()}
+    s["total_presents"] += 1
+    fire("mm-hm")
+    notify(f"{s['name']} has a gift for you", msg)
+    return s
+
+
+def mood(s):
+    """Return (glyph, color, label)."""
+    if not s["alive"]:
+        return ("✕", C_MUTED, "departed")
+    if stage_of(s) == "egg":
+        return ("o", C_YELLOW, "incubating")
+    h = s["hunger"]
+    j = s["happiness"]
+    score = (h + j) / 2
+    if score >= 70:
+        return ("❯", C_PINK, "thriving")
+    if score >= 50:
+        return ("❯", C_MAUVE, "content")
+    if score >= 30:
+        return (">", C_YELLOW, "okay")
+    if score >= 10:
+        return (">", C_RED, "struggling")
+    return ("·", C_RED, "barely there")
+
+
+def bar(value, width=20):
+    filled = int((value / 100) * width)
+    bar_str = "█" * filled + "░" * (width - filled)
+    if value >= 60:
+        c = C_GREEN
+    elif value >= 30:
+        c = C_YELLOW
+    else:
+        c = C_RED
+    return f"{c}{bar_str}{C_RESET} {C_MUTED}{value:3d}/100{C_RESET}"
+
+
+def render_status(s):
+    glyph, color, label = mood(s)
+    st = stage_of(s)
+    print(f"{C_MUTED}> nix-pet{C_RESET}")
+    print(f"{color}{glyph}{C_RESET}  {C_TEXT}{s['name']}{C_RESET}  {C_MUTED}({st}, {label}){C_RESET}")
+
+    if not s["alive"]:
+        died_at = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["death_time"]))
+        print(f"  {C_MUTED}died:        {C_RESET}{C_RED}{s['death_cause']}{C_RESET}  {C_MUTED}({died_at}){C_RESET}")
+        print(f"  {C_MUTED}a new egg will appear on next tick.{C_RESET}")
+        return
+
+    age_hours = (now() - s["born"]) // 3600
+    caps = stage_caps(s)
+
+    # Egg has different display — no stats, just incubation timer
+    if st == "egg":
+        hatch_in = max(0, 6 - age_hours)
+        print(f"  {C_MUTED}age:         {C_RESET}{C_TEXT}{age_hours}h{C_RESET}")
+        print(f"  {C_MUTED}hatches in:  {C_RESET}{C_YELLOW}{hatch_in}h{C_RESET}")
+        print(f"  {C_MUTED}lifecycle:   {C_RESET}{C_MUTED}~14 days from hatching{C_RESET}")
+        return
+
+    age_remaining = max(0, OLD_AGE_HOURS - age_hours)
+    print(f"  {C_MUTED}age:         {C_RESET}{C_TEXT}{age_hours}h{C_RESET}  {C_MUTED}(life left ~{age_remaining}h){C_RESET}")
+    print(f"  {C_MUTED}hunger:      {C_RESET}{bar(s['hunger'])}")
+    print(f"  {C_MUTED}happiness:   {C_RESET}{bar(s['happiness'])}")
+    bowl_str = "▮" * s["food_bowl"] + "▯" * (BOWL_MAX - s["food_bowl"])
+    print(f"  {C_MUTED}food bowl:   {C_RESET}{C_PEACH}{bowl_str}{C_RESET} {C_MUTED}{s['food_bowl']}/{BOWL_MAX}{C_RESET}")
+
+    if caps["walk"]:
+        walk_cd = WALK_COOLDOWN_SECS - (now() - s["last_walk"])
+        if walk_cd > 0:
+            print(f"  {C_MUTED}walk:        {C_RESET}{C_MUTED}cooldown {walk_cd // 60}m{C_RESET}")
+        else:
+            print(f"  {C_MUTED}walk:        {C_RESET}{C_GREEN}ready{C_RESET}")
+
+    if caps["tricks"]:
+        print(f"  {C_MUTED}tricks:      {C_RESET}{C_TEXT}{', '.join(caps['tricks'])}{C_RESET}")
+
+    if s.get("recent_misbehavior"):
+        mb = s["recent_misbehavior"]
+        ago = (now() - mb["time"]) // 60
+        print()
+        print(f"  {C_RED}❯{C_RESET} {C_TEXT}{mb['msg']}{C_RESET} {C_MUTED}({ago}m ago){C_RESET}")
+        print(f"  {C_MUTED}scold him:   {C_RESET}{C_TEXT}nix-pet scold{C_RESET}")
+
+    if s.get("recent_present"):
+        gp = s["recent_present"]
+        ago = (now() - gp["time"]) // 60
+        print()
+        print(f"  {C_PEACH}❯{C_RESET} {C_TEXT}{gp['msg']}{C_RESET} {C_MUTED}({ago}m ago){C_RESET}")
+        print(f"  {C_MUTED}thank him:   {C_RESET}{C_TEXT}nix-pet thanks{C_RESET}")
+
+
+def cmd_feed(s):
+    if not s["alive"]:
+        print(f"{C_MUTED}can't feed the departed.{C_RESET}")
+        return s
+    if not stage_caps(s)["feed"]:
+        print(f"{C_MUTED}{s['name']} is still an egg. nothing to feed.{C_RESET}")
+        return s
+    added = min(3, BOWL_MAX - s["food_bowl"])
+    if added == 0:
+        print(f"{C_MUTED}the bowl is full. {s['name']} will eat when hungry.{C_RESET}")
+        return s
+    s["food_bowl"] += added
+    print(f"{C_PINK}❯{C_RESET} {C_TEXT}filled the bowl. +{added} portions ({s['food_bowl']}/{BOWL_MAX}).{C_RESET}")
+    fire("nice")
+    return s
+
+
+def cmd_pet(s):
+    if not s["alive"]:
+        print(f"{C_MUTED}can't pet the departed.{C_RESET}")
+        return s
+    if not stage_caps(s)["pet"]:
+        print(f"{C_MUTED}you can't pet an egg. it just sits there.{C_RESET}")
+        return s
+    s["happiness"] = min(100, s["happiness"] + 15)
+    print(f"{C_PINK}❯{C_RESET} {C_TEXT}{s['name']} purrs. happiness {s['happiness']}/100.{C_RESET}")
+    fire("mm-hm")
+    return s
+
+
+def cmd_walk(s):
+    if not s["alive"]:
+        print(f"{C_MUTED}can't walk the departed.{C_RESET}")
+        return s
+    caps = stage_caps(s)
+    if not caps["walk"]:
+        print(f"{C_MUTED}{s['name']} is too young to walk. ({caps['stage']}){C_RESET}")
+        return s
+    cd_remaining = WALK_COOLDOWN_SECS - (now() - s["last_walk"])
+    if cd_remaining > 0:
+        print(f"{C_MUTED}{s['name']} is tired. try again in {cd_remaining // 60}m.{C_RESET}")
+        return s
+
+    glyph, color, _ = mood(s)
+    print(f"{C_PINK}❯{C_RESET} {C_TEXT}taking {s['name']} for a walk...{C_RESET}")
+    width = 50
+    for direction in (1, -1):
+        rng = range(width) if direction == 1 else range(width - 1, -1, -1)
+        for i in rng:
+            line = " " * i + glyph + " " * (width - i - 1)
+            sys.stdout.write(f"\r  {color}{line}{C_RESET}")
+            sys.stdout.flush()
+            time.sleep(0.025)
+    sys.stdout.write("\r" + " " * (width + 4) + "\r")
+
+    s["happiness"] = min(100, s["happiness"] + 25)
+    s["hunger"] = max(0, s["hunger"] - 10)
+    s["last_walk"] = now()
+    s["total_walks"] += 1
+    print(f"{C_PINK}❯{C_RESET} {C_TEXT}{s['name']} is happy. happiness {s['happiness']}/100, hunger {s['hunger']}/100.{C_RESET}")
+    fire("nice")
+    return s
+
+
+def cmd_scold(s):
+    if not s["alive"]:
+        print(f"{C_MUTED}can't scold the departed.{C_RESET}")
+        return s
+    if not s.get("recent_misbehavior"):
+        print(f"{C_MUTED}{s['name']} hasn't done anything (lately). nothing to scold.{C_RESET}")
+        return s
+    mb = s["recent_misbehavior"]
+    s["recent_misbehavior"] = None
+    s["happiness"] = max(0, s["happiness"] - 5)
+    s["total_scolds"] += 1
+    print(f"{C_PINK}❯{C_RESET} {C_TEXT}you scold {s['name']} for: {mb['msg']}{C_RESET}")
+    print(f"  {C_MUTED}{s['name']} looks down. happiness {s['happiness']}/100. he learned. probably.{C_RESET}")
+    fire("oh-no")
+    return s
+
+
+def cmd_praise(s):
+    if not s["alive"]:
+        print(f"{C_MUTED}can't praise the departed.{C_RESET}")
+        return s
+    s["happiness"] = min(100, s["happiness"] + 10)
+    s["total_praises"] += 1
+    print(f"{C_PINK}❯{C_RESET} {C_TEXT}you tell {s['name']} he's a good pet. he believes you.{C_RESET}")
+    print(f"  {C_MUTED}happiness {s['happiness']}/100.{C_RESET}")
+    fire("nice")
+    return s
+
+
+def cmd_name(s, name):
+    old = s["name"]
+    s["name"] = name
+    print(f"{C_PINK}❯{C_RESET} {C_TEXT}{old} is now {name}.{C_RESET}")
+    fire("noted")
+    return s
+
+
+
+
+def cmd_tick(s):
+    """Background tick — called by system-check timer.
+    Decay + age-up detection + misbehavior + present rolls + auto-replace."""
+    s = decay(s)
+    s = maybe_age_up(s)
+    s = maybe_misbehave(s)
+    s = maybe_present(s)
+    s = maybe_replace(s)
+    return s
+
+
+def cmd_thanks(s):
+    if not s["alive"]:
+        print(f"{C_MUTED}can't thank the departed.{C_RESET}")
+        return s
+    if not s.get("recent_present"):
+        print(f"{C_MUTED}{s['name']} hasn't brought you anything (lately).{C_RESET}")
+        return s
+    gp = s["recent_present"]
+    s["recent_present"] = None
+    s["happiness"] = min(100, s["happiness"] + 10)
+    s["total_thanks"] += 1
+    print(f"{C_PINK}❯{C_RESET} {C_TEXT}you thank {s['name']} for: {gp['msg']}{C_RESET}")
+    print(f"  {C_MUTED}{s['name']} purrs. happiness {s['happiness']}/100. mission accomplished.{C_RESET}")
+    fire("nice")
+    return s
+
+
+# Trick animations — keyed by trick name. Each gated by stage_caps().tricks
+TRICK_ANIMATIONS = {
+    "sit":       ("sits politely.",      ["❯", " ", "❯"], "noted"),
+    "rollover":  ("rolls over.",          ["❯", "v", "<", "^", "❯"], "nice"),
+    "shake":     ("offers a paw.",        ["❯", "❯-", "❯—", "❯-", "❯"], "nice"),
+    "play-dead": ("plays dead.",          ["❯", "✕", "✕", "✕", "❯"], "ha"),
+    "speak":     ("chirps at you.",       ["❯", "❯!", "❯", "❯!", "❯"], "fuck-yeah"),
+    "fetch":     ("fetches it.",          ["❯", "❯..", "❯....", "...❯", "..❯", "❯"], "there-it-is"),
+}
+
+
+def cmd_trick(s, trick_name):
+    if not s["alive"]:
+        print(f"{C_MUTED}can't trick the departed.{C_RESET}")
+        return s
+    caps = stage_caps(s)
+    available = caps["tricks"]
+    if not available:
+        print(f"{C_MUTED}{s['name']} doesn't know any tricks yet. ({caps['stage']}){C_RESET}")
+        return s
+    if trick_name is None:
+        print(f"{C_MUTED}usage: nix-pet trick <name>{C_RESET}")
+        print(f"  {C_TEXT}available:{C_RESET} {', '.join(available)}")
+        return s
+    if trick_name not in TRICK_ANIMATIONS:
+        print(f"{C_MUTED}unknown trick: {trick_name}{C_RESET}")
+        return s
+    if trick_name not in available:
+        print(f"{C_MUTED}{s['name']} hasn't learned `{trick_name}` yet. ({caps['stage']}){C_RESET}")
+        return s
+
+    msg, frames, voice = TRICK_ANIMATIONS[trick_name]
+    glyph_color, _ = (C_PINK, "")
+    print(f"{C_PINK}❯{C_RESET} {C_TEXT}{s['name']} {msg}{C_RESET}")
+    for frame in frames:
+        sys.stdout.write(f"\r  {C_PINK}{frame:<8}{C_RESET}")
+        sys.stdout.flush()
+        time.sleep(0.25)
+    sys.stdout.write("\r" + " " * 12 + "\r")
+    s["happiness"] = min(100, s["happiness"] + 3)
+    fire(voice)
+    return s
+
+
+def cmd_misbehave_debug(s):
+    """Force a misbehavior immediately. For testing/demo."""
+    s = maybe_misbehave(s, force=True)
+    if s.get("recent_misbehavior"):
+        print(f"{C_PINK}❯{C_RESET} {C_TEXT}{s['recent_misbehavior']['msg']}{C_RESET}")
+    return s
+
+
+def main():
+    s = load_state()
+    if s is None:
+        s = new_pet()
+        print(f"{C_PINK}❯{C_RESET} {C_TEXT}new pet: {s['name']}.{C_RESET}")
+        fire("welcome-home")
+        save_state(s)
+        render_status(s)
+        return
+
+    # Decay + age detection + auto-replace happen on every invocation
+    s = decay(s)
+    s = maybe_age_up(s)
+    s = maybe_replace(s)
+
+    cmd = sys.argv[1] if len(sys.argv) > 1 else None
+    trick_arg = sys.argv[2] if len(sys.argv) > 2 else None
+
+    if cmd == "feed":
+        s = cmd_feed(s)
+    elif cmd == "pet":
+        s = cmd_pet(s)
+    elif cmd == "walk":
+        s = cmd_walk(s)
+    elif cmd == "scold":
+        s = cmd_scold(s)
+    elif cmd == "praise":
+        s = cmd_praise(s)
+    elif cmd == "thanks":
+        s = cmd_thanks(s)
+    elif cmd == "trick":
+        s = cmd_trick(s, trick_arg)
+    elif cmd == "name" and len(sys.argv) > 2:
+        s = cmd_name(s, sys.argv[2])
+    elif cmd == "tick":
+        s = cmd_tick(s)
+        # tick is silent — no status output
+    elif cmd == "misbehave":
+        s = cmd_misbehave_debug(s)
+    elif cmd == "present":
+        # debug: force a present
+        s = maybe_present(s, force=True)
+        if s.get("recent_present"):
+            print(f"{C_PINK}❯{C_RESET} {C_TEXT}{s['recent_present']['msg']}{C_RESET}")
+    elif cmd in (None, "status"):
+        render_status(s)
+    else:
+        print(f"{C_MUTED}usage: nix-pet [feed|pet|walk|scold|praise|thanks|trick <name>|name <n>|status|tick]{C_RESET}")
+
+    save_state(s)
+
+
+if __name__ == "__main__":
+    main()
