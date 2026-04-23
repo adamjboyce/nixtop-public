@@ -10,3 +10,5 @@ __pycache__/
 
 # the git repo itself
 .git/
+memory/
+voice/
